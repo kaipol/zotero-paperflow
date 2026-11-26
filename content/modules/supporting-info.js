@@ -80,17 +80,27 @@ var AutoFullTextSupportingInfo = (function () {
 
   function isChallengeDocument(doc, currentURL = "") {
     if (!doc || !doc.documentElement || !/^https?:\/\//i.test(String(currentURL || ""))) return true;
-    if (isChallengeHTML("", doc.title || "")) return true;
+    const title = String(doc.title || "");
+    if (isChallengeHTML("", title)) return true;
     try {
       if (typeof doc.querySelector === "function" && doc.querySelector(
         '#challenge-running, #challenge-stage, #challenge-form, #cf-challenge-running, #cf-wrapper, #turnstile-wrapper, .cf-browser-verification, .cf-turnstile, input[name="cf-turnstile-response"], form[action*="__cf_chl"], iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, .h-captcha, #px-captcha',
       )) {
         return true;
       }
+      if (typeof doc.querySelector === "function" && doc.querySelector(
+        'meta[name="citation_doi"], meta[name="citation_title"], meta[name="dc.identifier"], meta[name="DC.Identifier"]',
+      )) {
+        return false;
+      }
     } catch {
       // Ignore selector error on partial documents.
     }
-    return isChallengeHTML(doc.documentElement.outerHTML || "", doc.title || "");
+    try {
+      return isChallengeHTML(doc.documentElement.outerHTML || "", title);
+    } catch {
+      return false;
+    }
   }
 
   function checkPublisherAccess(result, articleURL, status = null, html = "") {
@@ -197,41 +207,154 @@ var AutoFullTextSupportingInfo = (function () {
     return AutoFullText.safeName(filename) || `supporting-info${extension}`;
   }
 
-  function extractSupportingLink(doc, responseURL) {
-    if (!doc || typeof doc.querySelectorAll !== "function") return null;
-    const article = new URL(responseURL);
-    article.hash = "";
-    for (const anchor of doc.querySelectorAll("a[href]")) {
-      const target = anchor.getAttribute("href")?.trim();
-      if (!target || target.startsWith("#")) continue;
-      let url;
-      try {
-        url = new URL(AutoFullText.validateResourceURL(target, responseURL));
-      } catch (error) {
-        continue;
+  function isMainArticlePDFPath(pathname = "", anchorText = "") {
+    if (/\/(?:articlepdf|epdf|pdfdirect)\//i.test(pathname) && !supportingPattern.test(anchorText)) {
+      return true;
+    }
+    if (/\b(?:article\s*pdf|download\s*pdf|full\s*text\s*pdf|manuscript\s*pdf)\b/i.test(anchorText) && !supportingPattern.test(pathname)) {
+      return true;
+    }
+    return false;
+  }
+
+  function containerContextText(node) {
+    const parts = [];
+    try {
+      let current = node?.parentElement || null;
+      for (let depth = 0; current && depth < 4; depth += 1) {
+        const tag = String(current.tagName || "").toLowerCase();
+        const idClass = `${current.id || ""} ${current.className || ""}`;
+        if (/supp|esi|additional|supporting/i.test(idClass)) parts.push(idClass);
+        if (["li", "tr", "dd", "p", "div", "section", "article", "aside"].includes(tag)) {
+          const text = String(current.textContent || "").trim();
+          if (text && text.length <= 600) parts.push(text);
+          const heading = typeof current.querySelector === "function"
+            ? current.querySelector("h1, h2, h3, h4, h5, h6, legend, summary")
+            : null;
+          if (heading?.textContent) parts.push(heading.textContent);
+        }
+        const prev = current.previousElementSibling;
+        if (prev && /^h[1-6]$/i.test(String(prev.tagName || ""))) {
+          parts.push(prev.textContent || "");
+        }
+        current = current.parentElement;
       }
-      url.hash = "";
-      if (url.href === article.href) continue;
-      const download = anchor.getAttribute("download");
-      const label = [anchor.textContent, anchor.title, anchor.getAttribute("aria-label"), download, url.pathname, url.search].join(" ");
-      if (!supportingPattern.test(label)) continue;
-      const filename = filenameFor(url.href, anchor);
-      const hasFileHint = filePattern.test(filename) || filePattern.test(url.pathname) || filePattern.test(url.search) || download !== null;
-      const isBareDOISupplLanding = /^\/doi\/suppl\/10\.[^/]+\/[^/]+\/?$/i.test(url.pathname) && !hasFileHint;
-      if (isBareDOISupplLanding) continue;
-      if (!hasFileHint &&
-        !/\/(?:suppdata|suppl(?:ement(?:ary)?)?|files?|downloads?|downloadSupplement|attachments?|mmc\d+)(?:\/|$|\?)/i.test(url.pathname)) {
-        continue;
+    } catch {
+      // Ignore cross-compartment DOM traversal issues.
+    }
+    return parts.join(" ");
+  }
+
+  function extractSupportingLinkFromHTML(html, responseURL) {
+    const source = String(html || "");
+    if (!source) return null;
+    const patterns = [
+      /(?:https?:)?\/\/(?:www\.|static\.|pubs\.)?rsc(?:-cdn)?\.org\/suppdata\/[^\s"'<>\\]+?\.(?:pdf|docx?|xlsx?|pptx?|rtf|txt|csv|xml|odt|ods|odp)/gi,
+      /(?:https?:)?\/\/static-content\.springer\.com\/esm\/[^\s"'<>\\]+?\.(?:pdf|docx?|xlsx?|pptx?|rtf|txt|csv|xml|odt|ods|odp)/gi,
+      /(?:https?:)?\/\/[^/\s"'<>\\]+\/doi\/suppl\/[^\s"'<>\\]+?\/suppl_file\/[^\s"'<>\\]+?\.(?:pdf|docx?|xlsx?|pptx?|rtf|txt|csv|xml|odt|ods|odp)/gi,
+      /(?:https?:\/\/[^/\s"'<>\\]+)?\/[^\s"'<>\\]*(?:suppdata|suppl_file|downloadSupplement|MOESM\d+)[^\s"'<>\\]*?\.(?:pdf|docx?|xlsx?|pptx?|rtf|txt|csv|xml|odt|ods|odp)/gi,
+    ];
+    for (const pattern of patterns) {
+      let match;
+      while ((match = pattern.exec(source))) {
+        const raw = match[0].replace(/&amp;/gi, "&").replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+        try {
+          const validated = AutoFullText.validateResourceURL(raw, responseURL);
+          const parsed = new URL(validated);
+          const filename = AutoFullText.safeName(decodeURIComponent(parsed.pathname.split("/").pop() || "supporting-info")) || "supporting-info";
+          return { url: validated, filename };
+        } catch {
+          // Skip invalid or untrusted candidate URLs.
+        }
       }
-      return { url: url.href, filename };
     }
     return null;
+  }
+
+  function extractSupportingLink(doc, responseURL, rawHTML = "") {
+    const article = new URL(responseURL);
+    article.hash = "";
+    const pathHintPattern = /\/(?:suppdata|suppinfo|suppl_file|suppl(?:ement(?:ary)?)?|esi|esm|files?|downloads?|downloadSupplement|attachments?|getfile|asset|mmc\d+)(?:\/|$|\?)/i;
+
+    if (doc && typeof doc.querySelectorAll === "function") {
+      const anchors = doc.querySelectorAll("a[href], [data-href], [data-url], [data-download-url]");
+      const candidates = [];
+      for (let i = 0; i < anchors.length; i += 1) {
+        const anchor = anchors[i];
+        if (!anchor || typeof anchor.getAttribute !== "function") continue;
+        const target = (
+          anchor.getAttribute("href") ||
+          anchor.getAttribute("data-href") ||
+          anchor.getAttribute("data-url") ||
+          anchor.getAttribute("data-download-url") ||
+          ""
+        ).trim();
+        if (!target || target.startsWith("#") || /^javascript:/i.test(target)) continue;
+        let url;
+        try {
+          url = new URL(AutoFullText.validateResourceURL(target, responseURL));
+        } catch {
+          continue;
+        }
+        url.hash = "";
+        if (url.href === article.href) continue;
+        const download = anchor.getAttribute("download");
+        const anchorText = String(anchor.textContent || "");
+        const label = [anchorText, anchor.title, anchor.getAttribute("aria-label"), download, url.pathname, url.search].join(" ");
+        const filename = filenameFor(url.href, anchor);
+        const hasFileHint = filePattern.test(filename) || filePattern.test(url.pathname) || filePattern.test(url.search) || download !== null;
+        const isBareDOISupplLanding = /^\/doi\/suppl\/10\.[^/]+\/[^/]+\/?$/i.test(url.pathname) && !hasFileHint;
+        if (isBareDOISupplLanding) continue;
+
+        if (supportingPattern.test(label)) {
+          if (hasFileHint || pathHintPattern.test(url.pathname)) {
+            return { url: url.href, filename };
+          }
+        }
+        if (hasFileHint && !isMainArticlePDFPath(url.pathname, anchorText)) {
+          candidates.push({ anchor, url, filename });
+        }
+      }
+
+      // Pass 2: Match file download links inside an explicitly labeled Supporting / Supplementary Information section
+      for (let i = 0; i < candidates.length; i += 1) {
+        const { anchor, url, filename } = candidates[i];
+        const contextText = containerContextText(anchor);
+        if (supportingPattern.test(contextText)) {
+          return { url: url.href, filename };
+        }
+      }
+    }
+
+    // Pass 3: Fallback scan of raw HTML for explicit direct SI URLs (e.g. RSC suppdata / Springer ESM / ACS suppl_file)
+    let htmlSource = rawHTML;
+    if (!htmlSource && doc?.documentElement) {
+      try {
+        htmlSource = String(doc.documentElement.outerHTML || "");
+      } catch {
+        htmlSource = "";
+      }
+    }
+    return extractSupportingLinkFromHTML(htmlSource, responseURL);
+  }
+
+  function rscLandingFallbackURL(responseURL) {
+    try {
+      const parsed = new URL(responseURL);
+      if (parsed.hostname.toLowerCase() === "pubs.rsc.org" && /\/en\/content\/articlehtml\//i.test(parsed.pathname)) {
+        parsed.pathname = parsed.pathname.replace(/\/en\/content\/articlehtml\//i, "/en/content/articlelanding/");
+        return parsed.href;
+      }
+    } catch {
+      // Ignore invalid URL.
+    }
+    return "";
   }
 
   async function findLinks(articleURL, signal, workspace, attempt, userAgent) {
     const headers = { Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
     if (userAgent) headers["User-Agent"] = userAgent;
-    const { doc, responseURL } = await AutoFullText.fetchDocument(articleURL, {
+    const { doc, responseURL, rawText } = await AutoFullText.fetchDocument(articleURL, {
       signal,
       noCache: true,
       anon: false,
@@ -243,8 +366,32 @@ var AutoFullTextSupportingInfo = (function () {
       },
     });
     attempt.stage = "识别 SI 链接";
-    const parsedHTML = doc.documentElement?.outerHTML || "";
-    return { link: extractSupportingLink(doc, responseURL), responseURL, parsedHTML };
+    const parsedHTML = doc.documentElement?.outerHTML || rawText || "";
+    let link = extractSupportingLink(doc, responseURL, rawText || parsedHTML);
+    if (!link) {
+      const landingURL = rscLandingFallbackURL(responseURL);
+      if (landingURL) {
+        try {
+          const landing = await AutoFullText.fetchDocument(landingURL, {
+            signal,
+            noCache: true,
+            anon: false,
+            headers,
+            onResponse: (response, url) => inspectRequest(attempt, response, url),
+            onRawText: async (text, url) => {
+              await workspace.writeText("si-source-article-landing.html", text);
+              checkPublisherAccess(null, url, null, text.slice(0, 16384));
+            },
+          });
+          const landingHTML = landing.doc.documentElement?.outerHTML || landing.rawText || "";
+          link = extractSupportingLink(landing.doc, landing.responseURL, landing.rawText || landingHTML);
+          if (link) return { link, responseURL: landing.responseURL, parsedHTML: landingHTML };
+        } catch (fallbackError) {
+          AutoFullText.log("RSC articlelanding fallback failed", fallbackError);
+        }
+      }
+    }
+    return { link, responseURL, parsedHTML };
   }
 
   function stableSuffix(value) {
@@ -526,6 +673,15 @@ var AutoFullTextSupportingInfo = (function () {
           isChallengeDocument,
           isBlockedHost: (host) => AutoFullText.isLocalHost?.(host) || AutoFullText.isIPAddress?.(host) || false,
           hasSupportingLink: (doc, currentURL) => Boolean(extractSupportingLink(doc, currentURL)),
+          hasSupportingLinkHTML: (htmlText, currentURL) => {
+            try {
+              if (typeof DOMParser === "function" && htmlText) {
+                const parsed = new DOMParser().parseFromString(htmlText, "text/html");
+                return Boolean(extractSupportingLink(parsed, currentURL, htmlText));
+              }
+            } catch {}
+            return Boolean(extractSupportingLinkFromHTML(htmlText, currentURL));
+          },
           onWindowReady: (readyWin) => {
             if (initTimer) {
               clearTimeout(initTimer);
@@ -590,11 +746,74 @@ var AutoFullTextSupportingInfo = (function () {
       async onVerified({ doc, responseURL, html, handle }) {
         const activeSignal = combineSignals(signal, handle?.signal || null);
         throwIfAborted(activeSignal);
-        await workspace.writeText("si-source-article.html", html);
-        await workspace.writeText("si-source-article-parsed.html", html);
+        let activeHTML = String(html || "");
+        let activeURL = responseURL || challengeURL;
+        let activeDoc = doc || null;
+
+        if (!activeHTML && !activeDoc) {
+          attempt.stage = "读取已验证出版商文章页";
+          emitProgress(onProgress, "验证已通过，正在读取文章页 HTML…", 50);
+          const fetched = await findLinks(activeURL, activeSignal, workspace, attempt, userAgent);
+          if (fetched.link) {
+            activeURL = fetched.responseURL;
+            activeHTML = fetched.parsedHTML;
+            if (await hasExistingAttachment(item, fetched.link.url)) {
+              handle.setStatus?.("该 SI 附件已存在，已跳过重复导入。");
+              emitProgress(onProgress, "该 SI 附件已存在，已跳过重复导入。", 100);
+              return { skipped: true };
+            }
+            const filePrefix = `si-${Zotero.Utilities.randomString(6)}-`;
+            attempt.stage = "下载第一份 SI 文件";
+            attempt.request = null;
+            handle.setStatus?.(`已找到 SI（${fetched.link.filename}），正在自动下载…`, fetched.link.url);
+            emitProgress(onProgress, `已找到 SI（${fetched.link.filename}），正在自动下载…`, 70);
+            const downloaded = await downloadVerifiedLink(handle, fetched.link, activeURL, workspace, filePrefix, activeSignal, attempt, userAgent);
+            handle.setStatus?.("SI 下载完成，正在导入 Zotero 附件…");
+            emitProgress(onProgress, "SI 下载完成，准备导入 Zotero…", 82);
+            return { skipped: false, downloaded, link: fetched.link };
+          }
+          throw new Error("No supporting-information link was found on the article webpage.");
+        }
+
+        await workspace.writeText("si-source-article.html", activeHTML);
+        await workspace.writeText("si-source-article-parsed.html", activeHTML);
         attempt.stage = "识别 SI 链接";
         emitProgress(onProgress, "验证已通过，正在识别 SI 链接…", 55);
-        const link = extractSupportingLink(doc, responseURL);
+
+        let link = null;
+        if (activeHTML && typeof DOMParser === "function") {
+          try {
+            const parsedDoc = new DOMParser().parseFromString(activeHTML, "text/html");
+            link = extractSupportingLink(parsedDoc, activeURL, activeHTML);
+          } catch {
+            link = null;
+          }
+        }
+        if (!link && activeDoc) {
+          try {
+            link = extractSupportingLink(activeDoc, activeURL, activeHTML);
+          } catch {
+            link = null;
+          }
+        }
+        if (!link && activeHTML) {
+          link = extractSupportingLinkFromHTML(activeHTML, activeURL);
+        }
+        if (!link) {
+          const landingURL = rscLandingFallbackURL(activeURL);
+          if (landingURL) {
+            try {
+              emitProgress(onProgress, "正在检查出版商文章主页的 SI 链接…", 60);
+              const landing = await findLinks(landingURL, activeSignal, workspace, attempt, userAgent);
+              if (landing.link) {
+                link = landing.link;
+                activeURL = landing.responseURL;
+              }
+            } catch (fallbackError) {
+              AutoFullText.log("RSC articlelanding fallback in challenge session failed", fallbackError);
+            }
+          }
+        }
         if (!link) throw new Error("No supporting-information link was found on the article webpage.");
         if (await hasExistingAttachment(item, link.url)) {
           handle.setStatus?.("该 SI 附件已存在，已跳过重复导入。");
@@ -606,7 +825,7 @@ var AutoFullTextSupportingInfo = (function () {
         attempt.request = null;
         handle.setStatus?.(`已找到 SI（${link.filename}），正在自动下载…`, link.url);
         emitProgress(onProgress, `已找到 SI（${link.filename}），正在自动下载…`, 70);
-        const downloaded = await downloadVerifiedLink(handle, link, responseURL, workspace, filePrefix, activeSignal, attempt, userAgent);
+        const downloaded = await downloadVerifiedLink(handle, link, activeURL, workspace, filePrefix, activeSignal, attempt, userAgent);
         handle.setStatus?.("SI 下载完成，正在导入 Zotero 附件…");
         emitProgress(onProgress, "SI 下载完成，准备导入 Zotero…", 82);
         return { skipped: false, downloaded, link };

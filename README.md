@@ -26,6 +26,8 @@
 
 **0.3.16 质询窗口加载/刷新修复与全文翻译实时进度提示窗口：**修复 Zotero 10 质询窗口在 `<browser>` 尚未完成挂载时过早导航导致页面一直空白、点击「刷新」因读取到 `about:blank` 而跳转到 `about:blank` 的问题（改为等待窗口 `load` 与 `<browser>` 就绪后再导航，添加 `nodefaultsrc="true"` / `maychangeremoteness="false"`、多通道导航回退与超时重试，并严格过滤非 `http(s)` 地址）；同时为手动与自动「全文翻译」新增右下角实时进度提示窗口（逐阶段及逐片翻译进度条 +「取消翻译」按钮），与 SI 进度卡片垂直堆叠互不遮挡。
 
+**0.3.17 过检自动提取、手动按钮响应与 RSC SI 链接识别修复：**修复质询窗口轮询因跨沙箱 DOM 迭代异常或页头隐藏登录表单误判导致通过验证后无法自动提取、点击「已通过，立即提取 SI」无反应且提示框停留在加载页的问题（增加多途径文档读取、异常隔离、同域 HTML 重新解析、手动按钮强制触发与无 DOM 会话回退）；同时增强 RSC 等出版商 SI 链接识别（支持 `Supplementary files` 区块上下文链接、`data-href/data-url`、HTML 源码直链兜底以及 `pubs.rsc.org` `articlehtml` 自动回退 `articlelanding`）。
+
 ## 功能与实现结构
 
 ```text
@@ -94,7 +96,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ## 安装与试用
 
-1. 用 7-Zip 将 `zotero-paperflow-0.3.16.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
+1. 用 7-Zip 将 `zotero-paperflow-0.3.17.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
 2. 在 Zotero 中选择 **工具 → 插件 → 齿轮 → Install Plugin From File…**，选取该 XPI，按提示重启 Zotero。
 3. 打开 **编辑 → 设置 → Zotero PaperFlow**，分别选择两个选项并保存。全文翻译需选择已配置的供应商、设置模型与密钥环境变量、保存或自定义系统提示词；SI 的非 PDF 转换需要 Windows 与可用的 Microsoft Office 组件。PowerPoint 的 PDF 导出可能显示 PowerPoint 窗口。
 4. 新增具有 DOI/网页 URL 的测试文献验证自动选项；已有文献可在文库中选中后右键，分别执行补抓 SI 或生成中文全文翻译。
@@ -107,7 +109,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ```bash
 node scripts/build-xpi.mjs
-node test/package-smoke.mjs ../zotero-paperflow-0.3.16.xpi
+node test/package-smoke.mjs ../zotero-paperflow-0.3.17.xpi
 ```
 
 ## 当前验证边界

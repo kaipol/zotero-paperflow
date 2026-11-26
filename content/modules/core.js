@@ -12,16 +12,16 @@ var AutoFullText = (function () {
   const trustedRemoteRoots = [
     "springer.com", "springernature.com", "nature.com", "els-cdn.com", "elsevier.com",
     "sciencedirect.com", "figshare.com", "wiley.com", "oup.com", "pnas.org", "plos.org",
-    "rsc.org", "rsc-cdn.org", "mdpi.com", "frontiersin.org", "tandfonline.com",
+    "rsc.org", "rsc-cdn.org", "rsc.li", "mdpi.com", "frontiersin.org", "tandfonline.com",
     "sagepub.com", "acs.org", "iop.org", "cambridge.org", "science.org", "aaas.org",
-    "agu.org", "aps.org", "aip.org", "cell.com", "biomedcentral.com", "ieee.org",
+    "agu.org", "aps.org", "aip.org", "scitation.org", "cell.com", "biomedcentral.com", "ieee.org",
     "thelancet.com", "silverchair.com", "silverchair-cdn.com", "royalsocietypublishing.org",
     "annualreviews.org", "worldscientific.com", "degruyter.com", "arxiv.org",
-    "biorxiv.org", "medrxiv.org", "chemrxiv.org", "nih.gov", "bmj.com", "nejm.org",
+    "biorxiv.org", "medrxiv.org", "chemrxiv.org", "nih.gov", "europepmc.org", "bmj.com", "nejm.org",
     "jamanetwork.com", "asm.org", "ahajournals.org", "optica.org", "spiedigitallibrary.org",
     "acm.org", "elifesciences.org", "embopress.org", "cshlp.org", "rupress.org",
     "biologists.com", "beilstein-journals.org", "thieme-connect.com", "karger.com",
-    "liebertpub.com",
+    "liebertpub.com", "zenodo.org", "datadryad.org", "osf.io",
   ];
 
   function getPref(key) {

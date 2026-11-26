@@ -484,29 +484,59 @@
     }
 
     function isLoginOrAuthDoc(doc, currentURL) {
+      const urlText = String(currentURL || "");
+      if (/(?:\/(?:login|signin|sign-in|auth|sso|shibboleth|wayf|openathens|idp)\b)/i.test(urlText)) {
+        return true;
+      }
       try {
-        if (typeof doc?.querySelector === "function" && doc.querySelector('input[type="password"]')) {
+        const title = String(doc?.title || "");
+        const hasArticleMeta = typeof doc?.querySelector === "function" && Boolean(
+          doc.querySelector('meta[name="citation_doi"], meta[name="citation_title"], meta[name="dc.identifier"], meta[name="DC.Identifier"], meta[property="og:type"][content="article"]'),
+        );
+        if (hasArticleMeta) return false;
+        if (/(?:sign\s*in|log\s*in|institutional\s+login|single\s+sign-on|shibboleth|openathens)/i.test(title)) {
           return true;
+        }
+        if (typeof doc?.querySelector === "function") {
+          const passwordInput = doc.querySelector('input[type="password"]');
+          if (passwordInput) {
+            const isArticleURL = /\/(?:articlelanding|articlehtml|articles?|doi\/(?:full|abs|epdf)|science\/article|content\/)\b/i.test(urlText);
+            if (!isArticleURL) return true;
+          }
         }
       } catch {
         // Ignore query errors.
       }
-      return /(?:\/(?:login|signin|sign-in|auth|sso|shibboleth|wayf|openathens|idp)\b)/i.test(String(currentURL || ""));
+      return false;
+    }
+
+    function getContentDocument() {
+      try { if (browser?.contentDocument) return browser.contentDocument; } catch {}
+      try { if (browser?.contentWindow?.document) return browser.contentWindow.document; } catch {}
+      try { if (browser?.webNavigation?.document) return browser.webNavigation.document; } catch {}
+      try { if (browser?.docShell?.document) return browser.docShell.document; } catch {}
+      try { if (browser?.browsingContext?.currentWindowGlobal?.document) return browser.browsingContext.currentWindowGlobal.document; } catch {}
+      return null;
     }
 
     function currentLocation() {
       try {
         const fromURI = normalizeHttpURL(browser?.currentURI?.spec);
         if (fromURI) return fromURI;
-      } catch {
-        // Fall through to contentDocument URL.
-      }
+      } catch {}
       try {
-        const fromDoc = normalizeHttpURL(browser?.contentDocument?.location?.href);
+        const fromWebNav = normalizeHttpURL(browser?.webNavigation?.currentURI?.spec);
+        if (fromWebNav) return fromWebNav;
+      } catch {}
+      try {
+        const fromBC = normalizeHttpURL(browser?.browsingContext?.currentURI?.spec);
+        if (fromBC) return fromBC;
+      } catch {}
+      const doc = getContentDocument();
+      try {
+        const fromDoc = normalizeHttpURL(doc?.location?.href || doc?.URL);
         if (fromDoc) return fromDoc;
-      } catch {
-        // Fall through to contentWindow URL.
-      }
+      } catch {}
       try {
         return normalizeHttpURL(browser?.contentWindow?.location?.href);
       } catch {
@@ -730,81 +760,132 @@
       };
     }
 
+    function readDocumentHTML(doc) {
+      try {
+        return String(doc?.documentElement?.outerHTML || "");
+      } catch (error) {
+        debugLog("Could not serialize document outerHTML", error);
+        return "";
+      }
+    }
+
     function checkPageState() {
       if (settled || inDownloadPhase) return;
-      const currentURL = currentLocation();
-      if (!currentURL || !/^https?:\/\//i.test(currentURL)) return;
-      trackOriginForURL(currentURL);
-      if (urlEl) urlEl.textContent = currentURL;
-
-      let doc;
       try {
-        doc = browser?.contentDocument;
-      } catch {
-        return;
-      }
-      if (!doc || !doc.documentElement) return;
-      if (isDOIRedirectHost(currentURL)) {
-        setStatus("正在解析 DOI 并跳转至出版商页面…", currentURL);
-        return;
-      }
-
-      const hasLink = typeof session?.hasSupportingLink === "function"
-        ? Boolean(session.hasSupportingLink(doc, currentURL))
-        : false;
-
-      if (isChallengeDoc(doc, currentURL) && !(forceExtractRequested && hasLink)) {
-        pageVerifiedAt = 0;
-        lastVerifiedURL = "";
-        forceExtractRequested = false;
-        setStatus("检测到 Cloudflare / 安全验证，正在等待自动跳过；如出现验证框请手动点击完成…", currentURL);
-        return;
-      }
-
-      const ready = doc.readyState === "interactive" || doc.readyState === "complete";
-      if (!ready || !hasMeaningfulBody(doc)) return;
-
-      if (mode === "secondary") {
-        if (secondaryResolve) {
+        const currentURL = currentLocation();
+        const doc = getContentDocument();
+        if (forceExtractRequested && (!currentURL || !doc || !doc.documentElement)) {
+          const fallbackURL = currentURL || targetURL;
+          if (!fallbackURL || !/^https?:\/\//i.test(fallbackURL)) {
+            forceExtractRequested = false;
+            setStatus("页面尚未就绪，请等待页面加载完成或点击「刷新」重试。");
+            return;
+          }
           inDownloadPhase = true;
           stopMonitoring();
-          const resolveSecondary = secondaryResolve;
-          secondaryResolve = null;
-          secondaryReject = null;
-          setStatus("二次安全验证已通过，正在自动下载 SI 附件…", currentURL);
-          resolveSecondary({ responseURL: currentURL, doc });
+          setStatus("正在使用当前已验证会话提取 Supporting Information…", fallbackURL);
+          const html = doc ? readDocumentHTML(doc) : "";
+          const handle = createSessionHandle();
+          if (typeof session?.onVerified === "function") {
+            Promise.resolve(session.onVerified({ doc: doc || null, responseURL: fallbackURL, html, handle }))
+              .then((result) => succeedSession(result))
+              .catch((error) => failSession(error));
+          } else {
+            succeedSession({ doc: doc || null, responseURL: fallbackURL, html, handle });
+          }
+          return;
         }
-        return;
-      }
 
-      if (!hasLink && !forceExtractRequested && isLoginOrAuthDoc(doc, currentURL)) {
-        pageVerifiedAt = 0;
-        setStatus("检测到机构或账号登录页面，请完成登录，回到文章页后将自动提取 SI…", currentURL);
-        return;
-      }
+        if (!currentURL || !/^https?:\/\//i.test(currentURL)) return;
+        trackOriginForURL(currentURL);
+        if (urlEl) urlEl.textContent = currentURL;
+        if (!doc || !doc.documentElement) return;
+        if (isDOIRedirectHost(currentURL) && !forceExtractRequested) {
+          setStatus("正在解析 DOI 并跳转至出版商页面…", currentURL);
+          return;
+        }
 
-      if (currentURL !== lastVerifiedURL) {
-        lastVerifiedURL = currentURL;
-        pageVerifiedAt = Date.now();
-      }
+        let hasLink = false;
+        try {
+          if (typeof session?.hasSupportingLink === "function") {
+            hasLink = Boolean(session.hasSupportingLink(doc, currentURL));
+          }
+        } catch (error) {
+          debugLog("hasSupportingLink threw on contentDocument; will fall back to HTML check", error);
+          try {
+            const htmlPreview = readDocumentHTML(doc);
+            if (htmlPreview && typeof session?.hasSupportingLinkHTML === "function") {
+              hasLink = Boolean(session.hasSupportingLinkHTML(htmlPreview, currentURL));
+            }
+          } catch {}
+        }
 
-      const elapsed = Date.now() - pageVerifiedAt;
-      if (!hasLink && !forceExtractRequested && (doc.readyState !== "complete" || elapsed < HYDRATION_SETTLE_MS)) {
-        setStatus("验证已通过，正在等待文章页及 SI 链接加载完成…", currentURL);
-        return;
-      }
+        let challengeDetected = false;
+        try {
+          challengeDetected = isChallengeDoc(doc, currentURL);
+        } catch (error) {
+          debugLog("isChallengeDoc threw; using title fallback", error);
+          challengeDetected = /just a moment|attention required|checking your browser|security check|请稍候/i.test(String(doc?.title || ""));
+        }
 
-      inDownloadPhase = true;
-      stopMonitoring();
-      setStatus("验证已通过，正在自动识别并下载 Supporting Information…", currentURL);
-      const html = String(doc.documentElement.outerHTML || "");
-      const handle = createSessionHandle();
-      if (typeof session?.onVerified === "function") {
-        Promise.resolve(session.onVerified({ doc, responseURL: currentURL, html, handle }))
-          .then((result) => succeedSession(result))
-          .catch((error) => failSession(error));
-      } else {
-        succeedSession({ doc, responseURL: currentURL, html, handle });
+        if (challengeDetected && !forceExtractRequested) {
+          pageVerifiedAt = 0;
+          lastVerifiedURL = "";
+          setStatus("检测到 Cloudflare / 安全验证，正在等待自动跳过；如出现验证框请手动点击完成…", currentURL);
+          return;
+        }
+
+        const ready = doc.readyState === "interactive" || doc.readyState === "complete";
+        if (!forceExtractRequested && (!ready || !hasMeaningfulBody(doc))) return;
+
+        if (mode === "secondary") {
+          if (secondaryResolve) {
+            inDownloadPhase = true;
+            stopMonitoring();
+            const resolveSecondary = secondaryResolve;
+            secondaryResolve = null;
+            secondaryReject = null;
+            setStatus("二次安全验证已通过，正在自动下载 SI 附件…", currentURL);
+            resolveSecondary({ responseURL: currentURL, doc });
+          }
+          return;
+        }
+
+        if (!hasLink && !forceExtractRequested && isLoginOrAuthDoc(doc, currentURL)) {
+          pageVerifiedAt = 0;
+          setStatus("检测到机构或账号登录页面，请完成登录，回到文章页后将自动提取 SI…", currentURL);
+          return;
+        }
+
+        if (currentURL !== lastVerifiedURL) {
+          lastVerifiedURL = currentURL;
+          pageVerifiedAt = Date.now();
+        }
+
+        const elapsed = Date.now() - pageVerifiedAt;
+        if (!hasLink && !forceExtractRequested && (doc.readyState !== "complete" || elapsed < HYDRATION_SETTLE_MS)) {
+          setStatus("验证已通过，正在等待文章页及 SI 链接加载完成…", currentURL);
+          return;
+        }
+
+        inDownloadPhase = true;
+        stopMonitoring();
+        setStatus("验证已通过，正在自动识别并下载 Supporting Information…", currentURL);
+        const html = readDocumentHTML(doc);
+        const handle = createSessionHandle();
+        if (typeof session?.onVerified === "function") {
+          Promise.resolve(session.onVerified({ doc, responseURL: currentURL, html, handle }))
+            .then((result) => succeedSession(result))
+            .catch((error) => failSession(error));
+        } else {
+          succeedSession({ doc, responseURL: currentURL, html, handle });
+        }
+      } catch (error) {
+        debugLog("Unexpected error in checkPageState", error);
+        if (forceExtractRequested) {
+          forceExtractRequested = false;
+          setStatus(`提取触发异常：${String(error?.message || error)}`);
+        }
       }
     }
 
@@ -885,8 +966,13 @@
 
     if (extractBtn) {
       extractBtn.addEventListener("click", () => {
-        if (inDownloadPhase) return;
+        if (settled) return;
+        if (inDownloadPhase) {
+          setStatus("正在提取并下载 SI，请稍候…", currentLocation() || targetURL);
+          return;
+        }
         forceExtractRequested = true;
+        setStatus("正在提取当前页面的 SI 链接…", currentLocation() || targetURL);
         checkPageState();
       });
     }

@@ -1379,6 +1379,196 @@ assert.equal(siWorkspaceCleaned, true);
     cancelBtn.click();
     assert.equal(rejectedErr?.name, "SupportingInfoChallengeCancelledError");
   }
+
+  // Scenario I: RSC SI link discovery (contextual Supplementary files section, raw HTML suppdata fallback,
+  // and pubs.rsc.org /articlehtml/ -> /articlelanding/ fallback)
+  {
+    const contextualAnchor = {
+      textContent: "PDF (2.4 MB)",
+      title: "",
+      getAttribute: (name) => name === "href" ? "https://static.rsc.org/files/d6ee05315g1.pdf" : null,
+      parentElement: {
+        tagName: "LI",
+        id: "",
+        className: "list__item",
+        textContent: "Supplementary information PDF (2.4 MB)",
+        querySelector: () => null,
+        previousElementSibling: null,
+        parentElement: {
+          tagName: "DIV",
+          id: "",
+          className: "article__section",
+          textContent: "Supplementary files",
+          querySelector: () => ({ textContent: "Supplementary files" }),
+          previousElementSibling: null,
+          parentElement: null,
+        },
+      },
+    };
+    const mainArticlePdfAnchor = {
+      textContent: "Article PDF",
+      title: "",
+      getAttribute: (name) => name === "href" ? "/en/content/articlepdf/2026/ee/d6ee05315g" : null,
+      parentElement: null,
+    };
+    const rscContextualDoc = {
+      querySelectorAll: () => [mainArticlePdfAnchor, contextualAnchor],
+    };
+    const contextualFound = siMod.extractSupportingLink(
+      rscContextualDoc,
+      "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g",
+    );
+    assert.equal(
+      contextualFound?.url,
+      "https://static.rsc.org/files/d6ee05315g1.pdf",
+      "contextual SI section PDF link must be matched while skipping main article PDF",
+    );
+
+    const rscRawHtmlFound = siMod.extractSupportingLink(
+      { querySelectorAll: () => [] },
+      "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g",
+      '<html><body><script>var esi = "https://www.rsc.org/suppdata/d6/ee/d6ee05315g/d6ee05315g1.pdf";</script></body></html>',
+    );
+    assert.equal(
+      rscRawHtmlFound?.url,
+      "https://www.rsc.org/suppdata/d6/ee/d6ee05315g/d6ee05315g1.pdf",
+      "raw HTML fallback must extract direct RSC suppdata PDF URLs",
+    );
+  }
+
+  // Scenario J: Challenge window handles throwing hasSupportingLink (Xray error), hidden navbar password input
+  // on a real article page, and manual "已通过，立即提取 SI" button even when contentDocument is null
+  {
+    const btnListeners = new Map();
+    const statusEl = { textContent: "" };
+    const urlEl = { textContent: "" };
+    const makeBtn = (id) => ({
+      addEventListener: (type, fn) => btnListeners.set(`${id}:${type}`, fn),
+      click: () => btnListeners.get(`${id}:click`)?.(),
+    });
+    const reloadBtn = makeBtn("reload");
+    const extractBtn = makeBtn("extract");
+    const cancelBtn = makeBtn("cancel");
+    let verifiedPayload = null;
+    let resolvedPayload = null;
+    const jTarget = "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g";
+    const jBrowser = {
+      browsingContext: { customUserAgent: "" },
+      docShell: { allowJavascript: false },
+      currentURI: { spec: jTarget },
+      contentDocument: null,
+      contentWindow: null,
+      addEventListener: () => {},
+      addProgressListener: () => {},
+      removeProgressListener: () => {},
+      fixupAndLoadURIString: () => {},
+      setAttribute: () => {},
+    };
+    const jSession = {
+      url: jTarget,
+      userAgent: "Mozilla/5.0 Firefox/128.0",
+      hasSupportingLink: () => { throw new TypeError("Xray NodeList is not iterable"); },
+      hasSupportingLinkHTML: () => true,
+      onVerified: async (payload) => { verifiedPayload = payload; return { ok: true }; },
+      resolve: (res) => { resolvedPayload = res; },
+      reject: () => {},
+    };
+    const jContext = {
+      window: {
+        location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=j1" },
+        arguments: [{ wrappedJSObject: jSession }],
+        addEventListener: () => {},
+        close: () => {},
+      },
+      document: {
+        readyState: "complete",
+        getElementById: (id) => ({
+          "si-challenge-status": statusEl,
+          "si-challenge-url": urlEl,
+          "si-challenge-reload": reloadBtn,
+          "si-challenge-extract": extractBtn,
+          "si-challenge-cancel": cancelBtn,
+          "si-challenge-browser": jBrowser,
+        })[id] || null,
+      },
+      Services: mockServices,
+      Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+      URL,
+      Uint8Array,
+      AbortController,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      clearTimeout,
+      Date,
+    };
+    vm.createContext(jContext);
+    vm.runInContext(read("content/challenge-window.js"), jContext);
+    // Even when contentDocument is null, clicking "已通过，立即提取 SI" must immediately trigger onVerified with fallback URL
+    extractBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(verifiedPayload?.responseURL, jTarget, "manual Extract button must trigger onVerified even if contentDocument is unavailable");
+    assert.equal(resolvedPayload?.ok, true);
+
+    // Also verify real article page with hidden header password input + citation_doi meta auto-extracts cleanly despite throwing hasSupportingLink
+    let autoVerified = false;
+    const kBrowser = {
+      browsingContext: { customUserAgent: "" },
+      docShell: { allowJavascript: false },
+      currentURI: { spec: jTarget },
+      contentDocument: {
+        title: "Real RSC Article Title",
+        readyState: "complete",
+        body: { children: [{}], textContent: "Full article content with hidden navbar login modal." },
+        documentElement: { outerHTML: '<html><head><meta name="citation_doi" content="10.1039/d6ee05315g"></head><body><input type="password"/><a href="https://www.rsc.org/suppdata/d6/ee/d6ee05315g/d6ee05315g1.pdf">ESI</a></body></html>' },
+        querySelector: (sel) => {
+          if (sel.includes('meta[name="citation_doi"]')) return {};
+          if (sel.includes('input[type="password"]')) return {};
+          return null;
+        },
+        querySelectorAll: () => [],
+      },
+      contentWindow: null,
+      addEventListener: () => {},
+      addProgressListener: () => {},
+      removeProgressListener: () => {},
+      fixupAndLoadURIString: () => {},
+      setAttribute: () => {},
+    };
+    const kSession = {
+      url: jTarget,
+      userAgent: "Mozilla/5.0 Firefox/128.0",
+      hasSupportingLink: () => { throw new TypeError("Xray NodeList is not iterable"); },
+      hasSupportingLinkHTML: () => true,
+      onVerified: async () => { autoVerified = true; return { ok: true }; },
+      resolve: () => {},
+      reject: () => {},
+    };
+    const kContext = {
+      ...jContext,
+      window: {
+        location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=k1" },
+        arguments: [{ wrappedJSObject: kSession }],
+        addEventListener: () => {},
+        close: () => {},
+      },
+      document: {
+        readyState: "complete",
+        getElementById: (id) => ({
+          "si-challenge-status": statusEl,
+          "si-challenge-url": urlEl,
+          "si-challenge-reload": makeBtn("k-reload"),
+          "si-challenge-extract": makeBtn("k-extract"),
+          "si-challenge-cancel": makeBtn("k-cancel"),
+          "si-challenge-browser": kBrowser,
+        })[id] || null,
+      },
+    };
+    vm.createContext(kContext);
+    vm.runInContext(read("content/challenge-window.js"), kContext);
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    assert.equal(autoVerified, true, "verified article with hidden navbar password input and Xray-throwing hasSupportingLink must still auto-extract");
+  }
 }
 
 let releaseDelay;
