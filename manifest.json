@@ -1,0 +1,18 @@
+{
+  "manifest_version": 2,
+  "name": "Zotero PaperFlow",
+  "version": "0.3.13",
+  "icons": {
+    "48": "pane-icon.svg",
+    "96": "pane-icon.svg"
+  },
+  "description": "Automatically fetch supporting information and create Chinese full-text translation PDFs for newly added items.",
+  "applications": {
+    "zotero": {
+      "id": "zotero-auto-fulltext@local",
+      "update_url": "https://zotero-auto-fulltext.invalid/updates.json",
+      "strict_min_version": "10.0.8",
+      "strict_max_version": "10.*"
+    }
+  }
+}

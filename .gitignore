@@ -1,0 +1,19 @@
+# Build artifacts
+*.xpi
+
+# Generated smoke-test renders
+/test/pdf-smoke.pdf
+/test/site-style-smoke.html
+/test/site-style-smoke.pdf
+
+# Local diagnostics and runtime checkpoints
+si-error.txt
+translation-error.txt
+translation-progress.json
+translation-segments/
+
+# Local tooling
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>PDF 导出最小样例</title>
+<style>
+@page { size: A4; margin: 18mm; }
+body { color: #202124; font: 11pt/1.75 "Noto Serif CJK SC", "Songti SC", "SimSun", serif; }
+h1 { font-size: 20pt; line-height: 1.3; }
+h2 { font-size: 14pt; margin-top: 1.5em; }
+figure { margin: 1em auto; text-align: center; break-inside: avoid; }
+figure img { display: block; width: 100%; max-width: 520px; height: auto; margin: auto; }
+figcaption { color: #555; font-size: 9pt; margin-top: .5em; }
+a { color: #1558a6; text-decoration: underline; }
+.equation { text-align: center; margin: 1.2em 0; }
+</style>
+</head>
+<body>
+<h1>PDF 导出验证：中文正文、公式、图片和链接</h1>
+<p>本页用于检查自动附件插件生成 HTML 后的打印输出。段落包含中文、英文术语与缩写，例如 open-circuit voltage (V<sub>OC</sub>)，以确认中英文混排、上下标和段落换行。</p>
+<h2>公式</h2>
+<div class="equation"><math display="block"><mrow><mi>η</mi><mo>=</mo><mfrac><msub><mi>P</mi><mi>max</mi></msub><msub><mi>P</mi><mi>in</mi></msub></mfrac><mo>=</mo><msub><mi>V</mi><mi>OC</mi></msub><msub><mi>J</mi><mi>SC</mi></msub><mi>FF</mi><mo>/</mo><msub><mi>P</mi><mi>in</mi></msub></mrow></math></div>
+<h2>图片</h2>
+<figure>
+<img alt="SVG 柱状图样例" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='720' height='300' viewBox='0 0 720 300'%3E%3Crect width='720' height='300' fill='white'/%3E%3Cpath d='M70 250H680M70 250V30' stroke='%23333' stroke-width='2'/%3E%3Crect x='150' y='130' width='120' height='120' fill='%234f80c0'/%3E%3Crect x='390' y='75' width='120' height='175' fill='%23db8c52'/%3E%3Ctext x='160' y='275' font-size='20'%3EControl%3C/text%3E%3Ctext x='400' y='275' font-size='20'%3ETreatment%3C/text%3E%3C/svg%3E">
+<figcaption>图 1. 嵌入式 SVG 图片应完整打印且保持清晰。</figcaption>
+</figure>
+<p>正文链接应在 PDF 中保留可点击目标：<a href="https://www.zotero.org/">Zotero 官方网站</a>。</p>
+</body>
+</html>
