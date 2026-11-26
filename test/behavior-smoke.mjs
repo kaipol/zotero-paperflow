@@ -1263,6 +1263,122 @@ assert.equal(siWorkspaceCleaned, true);
   assert.ok(progressEvents.some((ev) => /正在读取出版商文章页/.test(ev.stage || "")), "must emit initial reading progress");
   assert.ok(progressEvents.some((ev) => /正在打开验证窗口/.test(ev.stage || "")), "must emit opening challenge progress");
   challengeSupportContext.Zotero.getMainWindow = origGetMainWindow;
+
+  // Scenario H: Challenge window waits for window "load" + browser readiness, falls back when fixupAndLoadURIString fails,
+  // and clicking Refresh while at about:blank reloads targetURL instead of jumping to about:blank
+  {
+    const winListeners = new Map();
+    const btnListeners = new Map();
+    const statusEl = { textContent: "" };
+    const urlEl = { textContent: "" };
+    const makeBtn = (id) => ({
+      addEventListener: (type, fn) => btnListeners.set(`${id}:${type}`, fn),
+      click: () => btnListeners.get(`${id}:click`)?.(),
+    });
+    const reloadBtn = makeBtn("reload");
+    const extractBtn = makeBtn("extract");
+    const cancelBtn = makeBtn("cancel");
+    let browserReloadCalls = 0;
+    const fallbackLoadedURLs = [];
+    const setAttrSrcCalls = [];
+    let readyCalled = false;
+    let firstFixupFailed = false;
+    const lazyBrowser = {
+      browsingContext: null,
+      docShell: null,
+      webNavigation: null,
+      currentURI: { spec: "about:blank" },
+      contentDocument: { location: { href: "about:blank" } },
+      contentWindow: { location: { href: "about:blank" } },
+      addEventListener: () => {},
+      addProgressListener: () => {},
+      removeProgressListener: () => {},
+      reload: () => { browserReloadCalls += 1; },
+      fixupAndLoadURIString: () => {
+        firstFixupFailed = true;
+        throw new Error("browsingContext not ready");
+      },
+      loadURI: (uri) => { fallbackLoadedURLs.push(uri.spec); },
+      setAttribute: (name, val) => { if (name === "src") setAttrSrcCalls.push(val); },
+    };
+    let rejectedErr = null;
+    const hTarget = "https://pubs.acs.org/doi/10.1021/jacs.00001";
+    const hSession = {
+      url: hTarget,
+      userAgent: "Mozilla/5.0 Firefox/128.0",
+      onWindowReady: () => { readyCalled = true; },
+      resolve: () => {},
+      reject: (err) => { rejectedErr = err; },
+    };
+    const hWindow = {
+      location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=h1" },
+      arguments: [{ wrappedJSObject: hSession }],
+      addEventListener: (type, fn) => {
+        if (!winListeners.has(type)) winListeners.set(type, []);
+        winListeners.get(type).push(fn);
+      },
+      close: () => {
+        (winListeners.get("unload") || []).forEach((fn) => fn());
+      },
+    };
+    const hDoc = {
+      readyState: "interactive",
+      getElementById: (id) => ({
+        "si-challenge-status": statusEl,
+        "si-challenge-url": urlEl,
+        "si-challenge-reload": reloadBtn,
+        "si-challenge-extract": extractBtn,
+        "si-challenge-cancel": cancelBtn,
+        "si-challenge-browser": lazyBrowser,
+      })[id] || null,
+    };
+    const hContext = {
+      window: hWindow,
+      document: hDoc,
+      Services: {
+        ...mockServices,
+        io: { newURI: (spec) => ({ spec }) },
+      },
+      Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+      URL,
+      Uint8Array,
+      AbortController,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      clearTimeout,
+      Date,
+    };
+    vm.createContext(hContext);
+    vm.runInContext(read("content/challenge-window.js"), hContext);
+    assert.equal(readyCalled, true, "onWindowReady must fire immediately even before window load");
+    assert.equal(fallbackLoadedURLs.length, 0, "navigation must wait until window load fires");
+
+    // Simulate XUL window "load" completing and MozBrowser attaching its browsingContext/docShell
+    hDoc.readyState = "complete";
+    lazyBrowser.browsingContext = { customUserAgent: "" };
+    lazyBrowser.docShell = { allowJavascript: false };
+    (winListeners.get("load") || []).forEach((fn) => fn());
+    assert.equal(firstFixupFailed, true, "should try fixupAndLoadURIString first");
+    assert.deepEqual(fallbackLoadedURLs, [hTarget], "should fall back immediately to browser.loadURI when fixupAndLoadURIString throws");
+    assert.equal(lazyBrowser.browsingContext.customUserAgent, "Mozilla/5.0 Firefox/128.0");
+    assert.equal(urlEl.textContent, hTarget);
+
+    // Clicking Refresh while browser is still at about:blank must NEVER jump to about:blank or call browser.reload()
+    reloadBtn.click();
+    assert.equal(browserReloadCalls, 0, "Refresh on about:blank must not call browser.reload()");
+    assert.equal(urlEl.textContent, hTarget, "Refresh on about:blank must keep showing targetURL, never about:blank");
+    assert.equal(fallbackLoadedURLs.length, 2, "Refresh on about:blank must re-navigate to targetURL");
+
+    // Once a real https:// page is loaded, Refresh should call browser.reload() and preserve the real URL
+    lazyBrowser.currentURI = { spec: "https://pubs.acs.org/doi/full/10.1021/jacs.00001" };
+    reloadBtn.click();
+    assert.equal(browserReloadCalls, 1, "Refresh on a loaded https page should call browser.reload()");
+    assert.equal(urlEl.textContent, "https://pubs.acs.org/doi/full/10.1021/jacs.00001");
+
+    cancelBtn.click();
+    assert.equal(rejectedErr?.name, "SupportingInfoChallengeCancelledError");
+  }
 }
 
 let releaseDelay;
@@ -1551,6 +1667,52 @@ assert.match(manualAlerts.at(-1), /完成 1 项/);
   assert.equal(manualSICalls, callsAfterPanelCancel + 1, "after clicking cancel button, next SI click must start a fresh task");
   releaseManualSI({ skipped: false });
   await flushManual();
+
+  // Verify floating progress panel for Full-Text Translation + live progress updates + Cancel button + concurrent stacking with SI
+  const prevCreate = manualContext.AutoFullTextTranslation.create;
+  let translationCancelObserved = false;
+  let translationCalls = 0;
+  manualContext.AutoFullTextTranslation.create = async (item, signal, opts) => {
+    translationCalls += 1;
+    translatedItems.push(item.id);
+    opts?.onProgress?.({ stage: "正在翻译正文（已完成 3/10 片，共 5 段）…", percent: 50 });
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        translationCancelObserved = true;
+        reject(Object.assign(new Error("Full-text translation cancelled."), { name: "AbortError" }));
+      }, { once: true });
+    });
+  };
+  manualMenu.menus[1].onCommand(null, singleSelection);
+  await flushManual();
+  const trStageNode = panelNodes.get("zotero-auto-fulltext-translation-stage");
+  const trBarNode = panelNodes.get("zotero-auto-fulltext-translation-bar");
+  const trCancelBtn = panelNodes.get("zotero-auto-fulltext-translation-cancel-btn");
+  assert.ok(trStageNode, "floating translation progress panel must appear immediately on click");
+  assert.match(trStageNode.textContent, /正在翻译正文（已完成 3\/10 片，共 5 段）/);
+  assert.equal(trBarNode?.style?.width, "50%");
+  assert.ok(trCancelBtn, "floating translation progress panel must render a cancel button");
+
+  // Clicking Generate Full-Text Translation again while running must report live stage and cancel hint
+  manualMenu.menus[1].onCommand(null, singleSelection);
+  await flushManual();
+  assert.match(manualAlerts.at(-1), /正在翻译正文（已完成 3\/10 片，共 5 段）[\s\S]*取消翻译/);
+
+  // Starting SI concurrently must stack both cards inside #zotero-auto-fulltext-progress-stack without removing translation card
+  await clickImport();
+  assert.ok(panelNodes.get("zotero-auto-fulltext-progress-stack"), "shared progress stack must exist");
+  assert.ok(panelNodes.get("zotero-auto-fulltext-si-progress"), "SI progress card must coexist with translation card");
+  assert.ok(panelNodes.get("zotero-auto-fulltext-translation-progress"), "translation card must remain mounted when SI starts");
+  releaseManualSI({ skipped: false });
+  await flushManual();
+
+  // Clicking Cancel on translation panel aborts translation and releases lock immediately
+  trCancelBtn.click();
+  await flushManual();
+  assert.equal(translationCancelObserved, true, "clicking cancel translation button must abort in-flight translation");
+  assert.match(manualAlerts.at(-1), /补处理已取消/);
+
+  manualContext.AutoFullTextTranslation.create = prevCreate;
   delete manualWindow.document;
 }
 

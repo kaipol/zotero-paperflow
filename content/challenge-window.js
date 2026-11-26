@@ -57,7 +57,7 @@
     return !value.includes(".");
   }
 
-  function init() {
+  function resolveSession() {
     const rawArgs = window.arguments?.[0];
     let session = rawArgs?.wrappedJSObject || rawArgs || null;
     if (!session) {
@@ -72,11 +72,18 @@
         // Ignore fallback lookup failure.
       }
     }
-    try {
-      session?.onWindowReady?.(window);
-    } catch {
-      // Ignore ready callback failure.
-    }
+    return session;
+  }
+
+  const initialSession = resolveSession();
+  try {
+    initialSession?.onWindowReady?.(window);
+  } catch {
+    // Ignore ready callback failure.
+  }
+
+  function init() {
+    const session = initialSession || resolveSession();
     const statusEl = document.getElementById("si-challenge-status");
     const urlEl = document.getElementById("si-challenge-url");
     const reloadBtn = document.getElementById("si-challenge-reload");
@@ -88,6 +95,8 @@
     let settled = false;
     let pollTimer = null;
     let timeoutTimer = null;
+    let navRetryTimer = null;
+    let readyRetryTimer = null;
     let progressListener = null;
     let httpModifyObserver = null;
     let httpResponseObserver = null;
@@ -103,6 +112,15 @@
     let secondaryResolve = null;
     let secondaryReject = null;
     const observedHosts = new Set(["challenges.cloudflare.com", "brunhild.challenges.cloudflare.com"]);
+
+    function debugLog(message, error) {
+      try {
+        const suffix = error ? `: ${String(error?.message || error)}` : "";
+        window.opener?.Zotero?.debug?.(`[Zotero PaperFlow][Challenge] ${message}${suffix}`);
+      } catch {
+        // Ignore debug log failures in minimal environments.
+      }
+    }
 
     function setStatus(text, currentURL = "") {
       const normalized = String(text || "");
@@ -120,9 +138,21 @@
       return isPrivateOrLocalHost(host);
     }
 
+    function getServices() {
+      if (typeof Services !== "undefined" && Services) return Services;
+      try {
+        if (window.Services) return window.Services;
+      } catch {}
+      try {
+        if (window.opener?.Services) return window.opener.Services;
+      } catch {}
+      return null;
+    }
+
     function applyTempPrefs() {
-      if (typeof Services === "undefined" || !Services?.prefs) return;
-      const prefs = Services.prefs;
+      const svc = getServices();
+      if (!svc?.prefs) return;
+      const prefs = svc.prefs;
       for (const [name, type, desired] of TEMP_PREF_OVERRIDES) {
         try {
           const hadUserValue = typeof prefs.prefHasUserValue === "function" && prefs.prefHasUserValue(name);
@@ -140,11 +170,12 @@
     }
 
     function restoreTempPrefs() {
-      if (typeof Services === "undefined" || !Services?.prefs) {
+      const svc = getServices();
+      if (!svc?.prefs) {
         savedPrefs = [];
         return;
       }
-      const prefs = Services.prefs;
+      const prefs = svc.prefs;
       while (savedPrefs.length) {
         const entry = savedPrefs.pop();
         try {
@@ -162,19 +193,20 @@
     }
 
     function allowCookiesForOrigins(origins) {
-      if (typeof Services === "undefined" || !Services?.perms || !Services?.scriptSecurityManager) return;
-      const ssm = Services.scriptSecurityManager;
-      const allow = Services.perms.ALLOW_ACTION ?? 1;
-      const expireSession = Services.perms.EXPIRE_SESSION ?? 1;
+      const svc = getServices();
+      if (!svc?.perms || !svc?.scriptSecurityManager) return;
+      const ssm = svc.scriptSecurityManager;
+      const allow = svc.perms.ALLOW_ACTION ?? 1;
+      const expireSession = svc.perms.EXPIRE_SESSION ?? 1;
       for (const origin of origins) {
         if (!origin) continue;
         try {
           const principal = typeof ssm.createContentPrincipalFromOrigin === "function"
             ? ssm.createContentPrincipalFromOrigin(origin)
-            : ssm.createContentPrincipal?.(Services.io.newURI(origin), {});
+            : ssm.createContentPrincipal?.(svc.io.newURI(origin), {});
           if (!principal) continue;
-          if (typeof Services.perms.addFromPrincipal === "function") {
-            Services.perms.addFromPrincipal(principal, "cookie", allow, expireSession);
+          if (typeof svc.perms.addFromPrincipal === "function") {
+            svc.perms.addFromPrincipal(principal, "cookie", allow, expireSession);
           }
         } catch {
           // Ignore unsupported permission API variants.
@@ -216,7 +248,8 @@
     }
 
     function attachObservers(userAgent) {
-      if (typeof Services === "undefined" || !Services?.obs?.addObserver) return;
+      const svc = getServices();
+      if (!svc?.obs?.addObserver) return;
 
       httpModifyObserver = {
         observe(subject, topic) {
@@ -226,7 +259,7 @@
               ? subject.QueryInterface(Components.interfaces.nsIHttpChannel)
               : subject;
             const scheme = String(channel?.URI?.scheme || "").toLowerCase();
-            if (scheme && scheme !== "http" && scheme !== "https") return;
+            if (scheme !== "http" && scheme !== "https") return;
             const host = String(channel?.URI?.host || "").toLowerCase();
             const fromOurBrowser = isChannelFromChallengeBrowser(channel);
 
@@ -294,22 +327,23 @@
         },
       };
 
-      try { Services.obs.addObserver(httpModifyObserver, "http-on-modify-request"); } catch { httpModifyObserver = null; }
-      try { Services.obs.addObserver(httpResponseObserver, "http-on-examine-response"); } catch { httpResponseObserver = null; }
-      try { Services.obs.addObserver(quitObserver, "quit-application-granted"); } catch { quitObserver = null; }
+      try { svc.obs.addObserver(httpModifyObserver, "http-on-modify-request"); } catch { httpModifyObserver = null; }
+      try { svc.obs.addObserver(httpResponseObserver, "http-on-examine-response"); } catch { httpResponseObserver = null; }
+      try { svc.obs.addObserver(quitObserver, "quit-application-granted"); } catch { quitObserver = null; }
     }
 
     function detachObservers() {
+      const svc = getServices();
       if (httpModifyObserver) {
-        try { Services?.obs?.removeObserver?.(httpModifyObserver, "http-on-modify-request"); } catch {}
+        try { svc?.obs?.removeObserver?.(httpModifyObserver, "http-on-modify-request"); } catch {}
         httpModifyObserver = null;
       }
       if (httpResponseObserver) {
-        try { Services?.obs?.removeObserver?.(httpResponseObserver, "http-on-examine-response"); } catch {}
+        try { svc?.obs?.removeObserver?.(httpResponseObserver, "http-on-examine-response"); } catch {}
         httpResponseObserver = null;
       }
       if (quitObserver) {
-        try { Services?.obs?.removeObserver?.(quitObserver, "quit-application-granted"); } catch {}
+        try { svc?.obs?.removeObserver?.(quitObserver, "quit-application-granted"); } catch {}
         quitObserver = null;
       }
     }
@@ -340,26 +374,91 @@
       }
     }
 
-    function navigate(url) {
+    function normalizeHttpURL(raw) {
+      const value = String(raw || "").trim();
+      return /^https?:\/\//i.test(value) ? value : "";
+    }
+
+    function clearNavRetry() {
+      if (navRetryTimer) {
+        clearTimeout(navRetryTimer);
+        navRetryTimer = null;
+      }
+    }
+
+    function tryNavigateMethod(url, methodIndex) {
+      const svc = getServices();
+      const ssm = svc?.scriptSecurityManager;
+      const systemPrincipal = ssm?.getSystemPrincipal?.();
+      const nullPrincipal = ssm?.createNullPrincipal?.({});
+      if (methodIndex === 0 && typeof browser.fixupAndLoadURIString === "function" && systemPrincipal) {
+        browser.fixupAndLoadURIString(url, { triggeringPrincipal: systemPrincipal });
+        return true;
+      }
+      if (methodIndex === 1 && typeof browser.loadURI === "function" && svc?.io?.newURI && systemPrincipal) {
+        browser.loadURI(svc.io.newURI(url), { triggeringPrincipal: systemPrincipal });
+        return true;
+      }
+      if (methodIndex === 2 && typeof browser.webNavigation?.loadURI === "function" && systemPrincipal) {
+        browser.webNavigation.loadURI(url, { triggeringPrincipal: systemPrincipal });
+        return true;
+      }
+      if (methodIndex === 3 && typeof browser.fixupAndLoadURIString === "function" && nullPrincipal) {
+        browser.fixupAndLoadURIString(url, { triggeringPrincipal: nullPrincipal });
+        return true;
+      }
+      if (methodIndex === 4 && typeof browser.contentWindow?.location?.assign === "function") {
+        browser.contentWindow.location.assign(url);
+        return true;
+      }
+      if (methodIndex === 5 && typeof browser.setAttribute === "function") {
+        browser.setAttribute("src", url);
+        return true;
+      }
+      return false;
+    }
+
+    function navigate(url, startMethodIndex = 0) {
       if (!browser || !url) return;
       targetURL = url;
+      clearNavRetry();
+      configureBrowser(session?.userAgent || "");
       trackOriginForURL(url);
       allowCookiesForOrigins(CHALLENGE_ORIGINS);
       setStatus("正在加载出版商页面…", url);
-      try {
-        const principal = Services?.scriptSecurityManager?.getSystemPrincipal?.();
-        if (typeof browser.fixupAndLoadURIString === "function" && principal) {
-          browser.fixupAndLoadURIString(url, { triggeringPrincipal: principal });
-          return;
+
+      let dispatchedMethod = -1;
+      for (let methodIndex = startMethodIndex; methodIndex <= 5; methodIndex += 1) {
+        try {
+          if (tryNavigateMethod(url, methodIndex)) {
+            dispatchedMethod = methodIndex;
+            break;
+          }
+        } catch (error) {
+          debugLog(`Navigation method ${methodIndex} failed for ${url}`, error);
         }
-        if (typeof browser.loadURI === "function" && Services?.io?.newURI && principal) {
-          browser.loadURI(Services.io.newURI(url), { triggeringPrincipal: principal });
-          return;
-        }
-      } catch {
-        // Fall back to attribute navigation below.
       }
-      browser.setAttribute("src", url);
+
+      if (dispatchedMethod < 0) {
+        debugLog(`No available browser navigation method succeeded for ${url}`);
+        return;
+      }
+
+      const nextMethodIndex = dispatchedMethod + 1;
+      if (nextMethodIndex <= 5) {
+        navRetryTimer = setTimeout(() => {
+          navRetryTimer = null;
+          if (settled || inDownloadPhase || targetURL !== url) return;
+          if (currentLocation()) return;
+          try {
+            if (browser?.webProgress?.isLoadingDocument) return;
+          } catch {
+            // Ignore unreadable webProgress.
+          }
+          debugLog(`Browser still at about:blank after method ${dispatchedMethod}; retrying with method ${nextMethodIndex}`);
+          navigate(url, nextMethodIndex);
+        }, 1200);
+      }
     }
 
     function isChallengeDoc(doc, currentURL) {
@@ -397,13 +496,19 @@
 
     function currentLocation() {
       try {
-        const fromURI = browser?.currentURI?.spec;
-        if (fromURI && fromURI !== "about:blank") return fromURI;
+        const fromURI = normalizeHttpURL(browser?.currentURI?.spec);
+        if (fromURI) return fromURI;
       } catch {
         // Fall through to contentDocument URL.
       }
       try {
-        return browser?.contentDocument?.location?.href || browser?.contentWindow?.location?.href || "";
+        const fromDoc = normalizeHttpURL(browser?.contentDocument?.location?.href);
+        if (fromDoc) return fromDoc;
+      } catch {
+        // Fall through to contentWindow URL.
+      }
+      try {
+        return normalizeHttpURL(browser?.contentWindow?.location?.href);
       } catch {
         return "";
       }
@@ -431,6 +536,11 @@
     }
 
     function stopMonitoring() {
+      clearNavRetry();
+      if (readyRetryTimer) {
+        clearTimeout(readyRetryTimer);
+        readyRetryTimer = null;
+      }
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
@@ -735,9 +845,11 @@
             if (stateFlags & stopFlag) checkPageState();
           },
           onLocationChange(_webProgress, _request, location) {
-            if (location?.spec) {
-              trackOriginForURL(location.spec);
-              if (urlEl) urlEl.textContent = location.spec;
+            const nextURL = normalizeHttpURL(location?.spec);
+            if (nextURL) {
+              clearNavRetry();
+              trackOriginForURL(nextURL);
+              if (urlEl) urlEl.textContent = nextURL;
             }
             checkPageState();
           },
@@ -760,12 +872,14 @@
         pageVerifiedAt = 0;
         lastVerifiedURL = "";
         forceExtractRequested = false;
-        const reloadTarget = currentLocation() || targetURL;
-        if (typeof browser?.reload === "function" && currentLocation()) {
-          setStatus("正在重新加载页面…", reloadTarget);
-          try { browser.reload(); return; } catch {}
+        const activeURL = currentLocation();
+        if (activeURL && typeof browser?.reload === "function") {
+          setStatus("正在重新加载页面…", activeURL);
+          try { browser.reload(); return; } catch (error) {
+            debugLog("browser.reload failed; falling back to navigate", error);
+          }
         }
-        navigate(reloadTarget);
+        navigate(activeURL || targetURL);
       });
     }
 
@@ -830,17 +944,35 @@
 
     applyTempPrefs();
     attachObservers(session?.userAgent || "");
-    configureBrowser(session?.userAgent || "");
-    startPolling();
-    if (targetURL) {
-      navigate(targetURL);
-    } else {
-      failSession(new Error("Challenge window was opened without a target URL."));
-    }
+
+    const startNavigationWhenReady = (attempt = 0) => {
+      if (settled) return;
+      const browserReady = Boolean(
+        browser?.browsingContext ||
+        browser?.docShell ||
+        browser?.webNavigation ||
+        attempt >= 20,
+      );
+      if (!browserReady) {
+        readyRetryTimer = setTimeout(() => {
+          readyRetryTimer = null;
+          startNavigationWhenReady(attempt + 1);
+        }, 50);
+        return;
+      }
+      configureBrowser(session?.userAgent || "");
+      startPolling();
+      if (targetURL) {
+        navigate(targetURL);
+      } else {
+        failSession(new Error("Challenge window was opened without a target URL."));
+      }
+    };
+    startNavigationWhenReady(0);
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init, { once: true });
+  if (document.readyState !== "complete" && typeof window.addEventListener === "function") {
+    window.addEventListener("load", init, { once: true });
   } else {
     init();
   }

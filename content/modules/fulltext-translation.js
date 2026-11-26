@@ -614,7 +614,16 @@ var AutoFullTextTranslation = (function () {
     }
   }
 
-  async function translateBlocks(root, baseURL, provider, item, systemPrompt, workspace, signal) {
+  function emitProgress(onProgress, stage, percent) {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress({ stage, percent });
+    } catch {
+      // Ignore UI progress callback failures.
+    }
+  }
+
+  async function translateBlocks(root, baseURL, provider, item, systemPrompt, workspace, signal, onProgress = null) {
     const records = [];
     const jobs = [];
     for (const block of getBlocks(root)) {
@@ -635,6 +644,7 @@ var AutoFullTextTranslation = (function () {
     if (!records.length || !jobs.length) {
       throw new Error("No translatable article paragraphs were found; refusing to export an empty translation.");
     }
+    emitProgress(onProgress, `正在翻译正文（0/${jobs.length} 片，共 ${records.length} 段）…`, 34);
 
     const progressDirectory = workspace.file("translation-segments");
     await OS.File.makeDir(progressDirectory);
@@ -677,6 +687,12 @@ var AutoFullTextTranslation = (function () {
         };
         batchEntries.push(progressEntry);
         completedSegments += 1;
+        const percent = 35 + Math.round((completedSegments / jobs.length) * 50);
+        emitProgress(
+          onProgress,
+          `正在翻译正文（已完成 ${completedSegments}/${jobs.length} 片，共 ${records.length} 段）…`,
+          percent,
+        );
         if (completedSegments % 20 === 0 || completedSegments === jobs.length) {
           const batchIndex = Math.ceil(completedSegments / 20).toString().padStart(4, "0");
           await workspace.writeText(`translation-segments/batch-${batchIndex}.json`, JSON.stringify(batchEntries));
@@ -706,6 +722,7 @@ var AutoFullTextTranslation = (function () {
       record.translations[partIndex] = results[index];
     });
 
+    emitProgress(onProgress, "正在校验并拼装中文译文…", 88);
     let translatedParagraphs = 0;
     try {
       for (const record of records) {
@@ -854,13 +871,14 @@ var AutoFullTextTranslation = (function () {
     return { styles, bodyAttributes };
   }
 
-  async function snapshotArticle(url, workspace, signal) {
+  async function snapshotArticle(url, workspace, signal, onProgress = null) {
     const { doc, responseURL } = await AutoFullText.fetchDocument(url, {
       signal,
       headers: { Accept: "text/html,application/xhtml+xml" },
       maxBytes: 30 * 1024 * 1024,
       onRawText: (text) => workspace.writeText("article-page-original.html", text),
     });
+    emitProgress(onProgress, "正在清洗正文并捕获页面样式…", 18);
     const sourceRoot = chooseArticleRoot(doc);
     const pageStyles = await capturePageStyles(doc, responseURL, signal);
     const root = wrapWithAncestors(sourceRoot, doc);
@@ -877,7 +895,7 @@ var AutoFullTextTranslation = (function () {
     throw error;
   }
 
-  async function create(item, signal = null) {
+  async function create(item, signal = null, { onProgress = null } = {}) {
     const url = AutoFullText.itemURL(item);
     if (!url) throw new Error("This item has neither a webpage URL nor DOI.");
     const workspace = await AutoFullTextPdf.createWorkspace();
@@ -891,8 +909,9 @@ var AutoFullTextTranslation = (function () {
 
     try {
       throwIfAborted(signal);
+      emitProgress(onProgress, "正在读取并解析文章网页…", 8);
       await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));
-      const snapshot = await snapshotArticle(url, workspace, signal);
+      const snapshot = await snapshotArticle(url, workspace, signal, onProgress);
       throwIfAborted(signal);
       await workspace.writeText("article-page-cleaned.html", snapshot.html);
       runInfo.stage = "article page saved";
@@ -902,6 +921,7 @@ var AutoFullTextTranslation = (function () {
       const root = doc.body.firstElementChild;
       if (!root || textLength(root) < 500) throw new Error("The cleaned article body is too short to translate.");
 
+      emitProgress(onProgress, "正在内联文章图片资源…", 26);
       await inlineImages(root, snapshot.responseURL, workspace, signal);
       throwIfAborted(signal);
       await workspace.writeText("article-page-assets-inlined.html", root.outerHTML);
@@ -913,7 +933,7 @@ var AutoFullTextTranslation = (function () {
       await workspace.writeText("translation-system-prompt.txt", systemPrompt);
       await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));
 
-      const progress = await translateBlocks(root, snapshot.responseURL, provider, item, systemPrompt, workspace, signal);
+      const progress = await translateBlocks(root, snapshot.responseURL, provider, item, systemPrompt, workspace, signal, onProgress);
       throwIfAborted(signal);
       runInfo.translatedParagraphs = progress.translatedParagraphs;
       runInfo.translatedSegments = progress.translatedSegments;
@@ -929,13 +949,16 @@ var AutoFullTextTranslation = (function () {
       runInfo.stage = "printing PDF";
       await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));
       throwIfAborted(signal);
+      emitProgress(onProgress, "正在排版并导出「全文翻译」PDF…", 92);
       const pdfPath = workspace.file("full-text-translation.pdf");
       await AutoFullTextPdf.printHtmlToPdf(html, pdfPath, workspace, signal);
       throwIfAborted(signal);
       runInfo.stage = "PDF generated";
       await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));
       throwIfAborted(signal);
+      emitProgress(onProgress, "正在导入「全文翻译」Zotero 子附件…", 97);
       await AutoFullTextPdf.attachPdf(item.id, pdfPath, "全文翻译");
+      emitProgress(onProgress, "「全文翻译」PDF 附件已导入。", 100);
       runInfo.stage = "attachment imported";
       try {
         await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));

@@ -12,8 +12,9 @@ var AutoFullTextMain = (function () {
   const queuedItems = new Set();
   const activeActions = new Map();
   const activeSIRuns = new Map();
+  const activeTranslationRuns = new Map();
   const activeControllers = new Set();
-  let activeProgressPanel = null;
+  const activeProgressPanels = new Map();
   let draining = false;
   let alive = false;
   let uiReady = false;
@@ -37,7 +38,24 @@ var AutoFullTextMain = (function () {
     return `文献 ${item?.key || item?.id || ""}`.trim();
   }
 
-  function createSIProgressPanel(win, { totalCount = 1, onCancel = null } = {}) {
+  function clearAllProgressPanels() {
+    for (const panel of [...activeProgressPanels.values()]) {
+      try { panel?.remove?.(); } catch {}
+    }
+    activeProgressPanels.clear();
+  }
+
+  function createTaskProgressPanel(win, {
+    kind = "si",
+    title = "导入 SI",
+    initialStage = "正在准备导入 Supporting Information…",
+    cancelLabel = "取消导入",
+    cancellingStage = "正在取消 SI 导入并清理状态…",
+    accentColor = "#2563eb",
+    showChallengeFocus = false,
+    totalCount = 1,
+    onCancel = null,
+  } = {}) {
     const doc = win?.document;
     const host = doc?.documentElement;
     if (!doc || !host || typeof doc.createElementNS !== "function") {
@@ -51,23 +69,40 @@ var AutoFullTextMain = (function () {
     }
 
     try {
-      activeProgressPanel?.remove?.();
+      activeProgressPanels.get(kind)?.remove?.();
     } catch {}
 
+    const idPrefix = `zotero-auto-fulltext-${kind}`;
     let dismissTimer = null;
     let challengeWin = null;
     let removed = false;
 
-    const existing = doc.getElementById?.("zotero-auto-fulltext-si-progress");
+    const existing = doc.getElementById?.(`${idPrefix}-progress`);
     existing?.remove?.();
 
+    const stackId = "zotero-auto-fulltext-progress-stack";
+    let stack = doc.getElementById?.(stackId);
+    if (!stack) {
+      stack = element(doc, "div");
+      stack.id = stackId;
+      stack.style.cssText = [
+        "position:fixed",
+        "right:18px",
+        "bottom:18px",
+        "z-index:2147483000",
+        "display:flex",
+        "flex-direction:column",
+        "gap:10px",
+        "align-items:flex-end",
+        "pointer-events:none",
+      ].join(";");
+      host.appendChild(stack);
+    }
+
     const card = element(doc, "div");
-    card.id = "zotero-auto-fulltext-si-progress";
+    card.id = `${idPrefix}-progress`;
     card.style.cssText = [
-      "position:fixed",
-      "right:18px",
-      "bottom:18px",
-      "z-index:2147483000",
+      "pointer-events:auto",
       "width:360px",
       "max-width:calc(100vw - 36px)",
       "padding:12px 14px",
@@ -84,58 +119,62 @@ var AutoFullTextMain = (function () {
 
     const header = element(doc, "div");
     header.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;";
-    const heading = element(doc, "div", totalCount > 1 ? `Zotero PaperFlow · 导入 SI (1/${totalCount})` : "Zotero PaperFlow · 导入 SI");
-    heading.id = "zotero-auto-fulltext-si-heading";
+    const heading = element(doc, "div", totalCount > 1 ? `Zotero PaperFlow · ${title} (1/${totalCount})` : `Zotero PaperFlow · ${title}`);
+    heading.id = `${idPrefix}-heading`;
     heading.style.cssText = "font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
     header.appendChild(heading);
 
     const itemLine = element(doc, "div", "");
-    itemLine.id = "zotero-auto-fulltext-si-item";
+    itemLine.id = `${idPrefix}-item`;
     itemLine.style.cssText = "font-size:12px;opacity:.78;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
 
-    const stageLine = element(doc, "div", "正在准备导入 Supporting Information…");
-    stageLine.id = "zotero-auto-fulltext-si-stage";
+    const stageLine = element(doc, "div", initialStage);
+    stageLine.id = `${idPrefix}-stage`;
     stageLine.style.cssText = "font-size:12px;line-height:1.4;";
 
     const barTrack = element(doc, "div");
     barTrack.style.cssText = "height:6px;width:100%;border-radius:999px;background:color-mix(in srgb,currentColor 14%,transparent);overflow:hidden;";
     const barFill = element(doc, "div");
-    barFill.id = "zotero-auto-fulltext-si-bar";
-    barFill.style.cssText = "height:100%;width:12%;border-radius:999px;background:#2563eb;transition:width 180ms ease;";
+    barFill.id = `${idPrefix}-bar`;
+    barFill.style.cssText = `height:100%;width:10%;border-radius:999px;background:${accentColor};transition:width 180ms ease;`;
     barTrack.appendChild(barFill);
 
     const actions = element(doc, "div");
     actions.style.cssText = "display:flex;align-items:center;justify-content:flex-end;gap:8px;";
 
-    const focusChallengeBtn = element(doc, "button", "显示验证窗口");
-    focusChallengeBtn.id = "zotero-auto-fulltext-si-focus-btn";
-    focusChallengeBtn.type = "button";
-    focusChallengeBtn.style.cssText = "display:none;padding:4px 10px;cursor:pointer;";
-    focusChallengeBtn.addEventListener("click", () => {
-      try { challengeWin?.focus?.(); } catch {}
-    });
+    let focusChallengeBtn = null;
+    if (showChallengeFocus) {
+      focusChallengeBtn = element(doc, "button", "显示验证窗口");
+      focusChallengeBtn.id = `${idPrefix}-focus-btn`;
+      focusChallengeBtn.type = "button";
+      focusChallengeBtn.style.cssText = "display:none;padding:4px 10px;cursor:pointer;";
+      focusChallengeBtn.addEventListener("click", () => {
+        try { challengeWin?.focus?.(); } catch {}
+      });
+    }
 
-    const cancelBtn = element(doc, "button", "取消导入");
-    cancelBtn.id = "zotero-auto-fulltext-si-cancel-btn";
+    const cancelBtn = element(doc, "button", cancelLabel);
+    cancelBtn.id = `${idPrefix}-cancel-btn`;
     cancelBtn.type = "button";
     cancelBtn.style.cssText = "padding:4px 10px;cursor:pointer;";
     cancelBtn.addEventListener("click", () => {
       cancelBtn.disabled = true;
       cancelBtn.textContent = "正在取消…";
-      stageLine.textContent = "正在取消 SI 导入并清理状态…";
+      stageLine.textContent = cancellingStage;
       onCancel?.();
     });
 
-    actions.append(focusChallengeBtn, cancelBtn);
+    if (focusChallengeBtn) actions.append(focusChallengeBtn, cancelBtn);
+    else actions.append(cancelBtn);
     card.append(header, itemLine, stageLine, barTrack, actions);
-    host.appendChild(card);
+    stack.appendChild(card);
 
     const panel = {
       setItem(index, label) {
         if (removed) return;
         heading.textContent = totalCount > 1
-          ? `Zotero PaperFlow · 导入 SI (${index}/${totalCount})`
-          : "Zotero PaperFlow · 导入 SI";
+          ? `Zotero PaperFlow · ${title} (${index}/${totalCount})`
+          : `Zotero PaperFlow · ${title}`;
         itemLine.textContent = String(label || "");
       },
       update(stage, percent) {
@@ -147,7 +186,7 @@ var AutoFullTextMain = (function () {
         }
       },
       setChallengeWindow(winRef) {
-        if (removed) return;
+        if (removed || !focusChallengeBtn) return;
         challengeWin = winRef || null;
         focusChallengeBtn.style.display = challengeWin ? "inline-block" : "none";
       },
@@ -157,7 +196,7 @@ var AutoFullTextMain = (function () {
         barFill.style.width = "100%";
         if (isError) barFill.style.background = "#dc2626";
         else barFill.style.background = "#16a34a";
-        focusChallengeBtn.style.display = "none";
+        if (focusChallengeBtn) focusChallengeBtn.style.display = "none";
         cancelBtn.style.display = "none";
         if (dismissTimer) {
           try { (win.clearTimeout || clearTimeout)(dismissTimer); } catch {}
@@ -173,11 +212,42 @@ var AutoFullTextMain = (function () {
           dismissTimer = null;
         }
         try { card.remove(); } catch {}
-        if (activeProgressPanel === panel) activeProgressPanel = null;
+        if (activeProgressPanels.get(kind) === panel) activeProgressPanels.delete(kind);
+        if (activeProgressPanels.size === 0) {
+          try { stack.remove(); } catch {}
+        }
       },
     };
-    activeProgressPanel = panel;
+    activeProgressPanels.set(kind, panel);
     return panel;
+  }
+
+  function createSIProgressPanel(win, { totalCount = 1, onCancel = null } = {}) {
+    return createTaskProgressPanel(win, {
+      kind: "si",
+      title: "导入 SI",
+      initialStage: "正在准备导入 Supporting Information…",
+      cancelLabel: "取消导入",
+      cancellingStage: "正在取消 SI 导入并清理状态…",
+      accentColor: "#2563eb",
+      showChallengeFocus: true,
+      totalCount,
+      onCancel,
+    });
+  }
+
+  function createTranslationProgressPanel(win, { totalCount = 1, onCancel = null } = {}) {
+    return createTaskProgressPanel(win, {
+      kind: "translation",
+      title: "全文翻译",
+      initialStage: "正在准备生成中文「全文翻译」…",
+      cancelLabel: "取消翻译",
+      cancellingStage: "正在取消全文翻译并清理中间文件…",
+      accentColor: "#0f766e",
+      showChallengeFocus: false,
+      totalCount,
+      onCancel,
+    });
   }
 
   async function processItem(itemID, requestedActions = null, { progressPanel = null, externalCancelRef = null } = {}) {
@@ -213,6 +283,9 @@ var AutoFullTextMain = (function () {
       if (action === "supportingInfo" && activeSIRuns.get(itemID)?.controller === controller) {
         activeSIRuns.delete(itemID);
       }
+      if (action === "fullTextTranslation" && activeTranslationRuns.get(itemID)?.controller === controller) {
+        activeTranslationRuns.delete(itemID);
+      }
       if (!lockedActions.delete(action)) return;
       actionSet.delete(action);
       if (!actionSet.size && activeActions.get(itemID) === actionSet) activeActions.delete(itemID);
@@ -247,7 +320,7 @@ var AutoFullTextMain = (function () {
             onCancel: () => controller.abort(),
           })
           : null);
-        ownProgressPanel?.setItem?.(1, itemDisplayLabel(item));
+        if (!progressPanel && ownProgressPanel) ownProgressPanel.setItem(1, itemDisplayLabel(item));
         const runInfo = {
           controller,
           stage: "正在读取出版商文章页…",
@@ -306,23 +379,57 @@ var AutoFullTextMain = (function () {
 
       if (getTranslation) {
         if (!alive || signal.aborted) return cancelledResult();
+        const externalTranslationPanel = requestedActions?.fullTextTranslation ? progressPanel : null;
+        const ownTranslationPanel = externalTranslationPanel || (!requestedActions
+          ? createTranslationProgressPanel(Zotero.getMainWindow(), {
+            totalCount: 1,
+            onCancel: () => controller.abort(),
+          })
+          : null);
+        if (!externalTranslationPanel && ownTranslationPanel) ownTranslationPanel.setItem(1, itemDisplayLabel(item));
+        const translationRunInfo = {
+          controller,
+          stage: "正在读取并解析文章网页…",
+        };
+        activeTranslationRuns.set(itemID, translationRunInfo);
         try {
           if (hasAttachment(item, "全文翻译")) {
             skipped += 1;
+            if (!externalTranslationPanel && ownTranslationPanel) {
+              ownTranslationPanel.finish("「全文翻译」附件已存在，已跳过。");
+            }
           } else {
-            await AutoFullTextTranslation.create(item, signal);
+            await AutoFullTextTranslation.create(item, signal, {
+              onProgress: ({ stage, percent }) => {
+                if (stage) translationRunInfo.stage = stage;
+                ownTranslationPanel?.update?.(stage, percent);
+              },
+            });
             completed += 1;
+            if (!externalTranslationPanel && ownTranslationPanel) {
+              ownTranslationPanel.finish("「全文翻译」PDF 附件已导入。");
+            }
           }
         } catch (error) {
-          if (isCancellation(signal)) return cancelledResult();
+          if (isCancellation(signal)) {
+            if (!externalTranslationPanel && ownTranslationPanel) {
+              ownTranslationPanel.finish("已取消全文翻译。", { isError: true, delayMs: 2000 });
+            }
+            return cancelledResult();
+          }
           failed += 1;
           translationFailed = true;
           const detail = String(error?.message || error);
           errors.push(`全文翻译：${detail}`);
           AutoFullText.log(`Full-text translation stopped for ${item.key}`, error);
+          if (!externalTranslationPanel && ownTranslationPanel) {
+            ownTranslationPanel.finish("全文翻译已停止。", { isError: true, delayMs: 3600 });
+          }
           if (!requestedActions) {
             Zotero.getMainWindow()?.alert(`文献 ${item.key} 的全文翻译已停止。\n${detail}`);
           }
+        } finally {
+          releaseAction("fullTextTranslation");
         }
       }
       return { completed, failed, skipped, inProgress, errors, translationFailed, siFailure };
@@ -696,21 +803,25 @@ var AutoFullTextMain = (function () {
     }
 
     const isSIAction = Boolean(requestedActions?.supportingInfo);
-    const allAlreadyRunning = isSIAction && items.every((item) => activeActions.get(item.id)?.has("supportingInfo"));
-    if (allAlreadyRunning) {
+    const isTranslationAction = Boolean(requestedActions?.fullTextTranslation);
+    const allAlreadyRunning = (isSIAction && items.every((item) => activeActions.get(item.id)?.has("supportingInfo"))) ||
+      (isTranslationAction && items.every((item) => activeActions.get(item.id)?.has("fullTextTranslation")));
+    if (isSIAction && allAlreadyRunning) {
       const runningInfo = activeSIRuns.get(items[0].id);
       try { runningInfo?.focusChallenge?.(); } catch {}
     }
 
     const cancelRef = { cancelled: false, abortCurrent: null };
-    const progressPanel = isSIAction && !allAlreadyRunning
-      ? createSIProgressPanel(win, {
-        totalCount: items.length,
-        onCancel: () => {
-          cancelRef.cancelled = true;
-          cancelRef.abortCurrent?.();
-        },
-      })
+    const onCancel = () => {
+      cancelRef.cancelled = true;
+      cancelRef.abortCurrent?.();
+    };
+    const progressPanel = !allAlreadyRunning
+      ? (isSIAction
+        ? createSIProgressPanel(win, { totalCount: items.length, onCancel })
+        : (isTranslationAction
+          ? createTranslationProgressPanel(win, { totalCount: items.length, onCancel })
+          : null))
       : null;
 
     const total = { completed: 0, failed: 0, skipped: 0, inProgress: 0, errors: [], processed: 0, stopped: "", siFailure: null };
@@ -721,7 +832,7 @@ var AutoFullTextMain = (function () {
       }
       total.processed += 1;
       progressPanel?.setItem?.(total.processed, itemDisplayLabel(item));
-      progressPanel?.update?.("正在启动 SI 导入…", 10);
+      progressPanel?.update?.(isSIAction ? "正在启动 SI 导入…" : "正在准备生成中文「全文翻译」…", 8);
       let result;
       try {
         result = await processItem(item.id, requestedActions, { progressPanel, externalCancelRef: cancelRef });
@@ -751,16 +862,20 @@ var AutoFullTextMain = (function () {
       }
     }
     if (progressPanel) {
-      if (total.stopped === "已取消") progressPanel.finish("已取消 SI 导入。", { isError: true, delayMs: 2200 });
-      else if (total.failed > 0) progressPanel.finish(`SI 导入结束：完成 ${total.completed} 项，失败 ${total.failed} 项。`, { isError: true, delayMs: 3200 });
-      else progressPanel.finish(`SI 导入完成：完成 ${total.completed} 项，跳过 ${total.skipped} 项。`, { isError: false, delayMs: 2600 });
+      const taskLabel = isSIAction ? "SI 导入" : "全文翻译";
+      if (total.stopped === "已取消") progressPanel.finish(`已取消${taskLabel}。`, { isError: true, delayMs: 2200 });
+      else if (total.failed > 0) progressPanel.finish(`${taskLabel}结束：完成 ${total.completed} 项，失败 ${total.failed} 项。`, { isError: true, delayMs: 3400 });
+      else progressPanel.finish(`${taskLabel}完成：完成 ${total.completed} 项，跳过 ${total.skipped} 项。`, { isError: false, delayMs: 2600 });
     }
     if (!alive || !win) return;
     const notStarted = items.length - total.processed;
     const details = total.errors.slice(0, 5).map((message) => `\n• ${message}`).join("");
-    const runningStage = total.inProgress && items.length === 1 ? activeSIRuns.get(items[0].id)?.stage : "";
+    const runningStage = total.inProgress && items.length === 1
+      ? (isSIAction ? activeSIRuns.get(items[0].id)?.stage : activeTranslationRuns.get(items[0].id)?.stage)
+      : "";
+    const cancelBtnLabel = isSIAction ? "取消导入" : "取消翻译";
     const inProgressNote = total.inProgress
-      ? `，已有 ${total.inProgress} 项正在处理中${runningStage ? `（当前阶段：${runningStage}；可在右下角进度条点击「取消导入」）` : ""}`
+      ? `，已有 ${total.inProgress} 项正在处理中${runningStage ? `（当前阶段：${runningStage}；可在右下角进度条点击「${cancelBtnLabel}」）` : ""}`
       : "";
     const summary = `补处理${total.stopped || "完成"}：已处理 ${total.processed}/${items.length} 条文献，完成 ${total.completed} 项，失败 ${total.failed} 项，跳过 ${total.skipped} 项${inProgressNote}。${notStarted ? ` 还有 ${notStarted} 条未处理。` : ""}${details}\n更多详情见 Zotero Debug Output。`;
     if (total.siFailure && !total.stopped && items.length === 1) {
@@ -839,10 +954,11 @@ var AutoFullTextMain = (function () {
     alive = true;
     activeActions.clear();
     activeSIRuns.clear();
+    activeTranslationRuns.clear();
     activeControllers.clear();
     pendingItems.length = 0;
     queuedItems.clear();
-    activeProgressPanel?.remove?.();
+    clearAllProgressPanels();
     AutoFullTextSupportingInfo.resetSessionState?.();
     AutoFullTextPdf.setRootURI(data.rootURI);
     await Zotero.initializationPromise;
@@ -892,7 +1008,8 @@ var AutoFullTextMain = (function () {
     activeControllers.clear();
     activeActions.clear();
     activeSIRuns.clear();
-    activeProgressPanel?.remove?.();
+    activeTranslationRuns.clear();
+    clearAllProgressPanels();
     AutoFullTextSupportingInfo.resetSessionState?.();
     if (observerID) {
       try { Zotero.Notifier.unregisterObserver(observerID); }
