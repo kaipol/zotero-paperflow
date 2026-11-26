@@ -79,24 +79,33 @@ var AutoFullTextMain = (function () {
       }
 
       if (getSI) {
+        let siResult = null;
         try {
-          const result = await AutoFullTextSupportingInfo.addForItem(item, signal);
-          if (result.skipped) skipped += 1;
+          siResult = await AutoFullTextSupportingInfo.addForItem(item, signal, { allowChallengeWindow: true });
+          if (siResult?.skipped) skipped += 1;
           else completed += 1;
         } catch (error) {
           if (isCancellation(signal)) return cancelledResult();
-          failed += 1;
-          const detail = String(error?.message || error);
-          siFailure = {
-            publisherURL: error?.publisherURL || "",
-            accessBlocked: error?.name === "SupportingInfoAccessError",
-          };
-          errors.push(`Supporting Information: ${detail}`);
-          AutoFullText.log(`Supporting information failed for ${item.key}: ${detail}`);
+          if (error?.name === "SupportingInfoChallengeCancelledError") {
+            if (requestedActions) return cancelledResult();
+            skipped += 1;
+          } else {
+            failed += 1;
+            const detail = String(error?.message || error);
+            siFailure = {
+              publisherURL: error?.publisherURL || "",
+              accessBlocked: error?.name === "SupportingInfoAccessError",
+            };
+            errors.push(`Supporting Information: ${detail}`);
+            AutoFullText.log(`Supporting information failed for ${item.key}: ${detail}`);
+          }
         } finally {
           releaseAction("supportingInfo");
         }
         if (!alive || signal.aborted) return cancelledResult();
+        if (siResult?.usedChallengeWindow && !siResult?.skipped && !requestedActions) {
+          showSISuccessNotice(Zotero.getMainWindow(), `文献 ${item.key} 的 Supporting Information 已通过验证并自动导入。`);
+        }
         if (siFailure && !requestedActions) {
           showSIFailure(Zotero.getMainWindow(), siFailure, `文献 ${item.key} 的 SI 导入失败。\n${errors[0]}`, false);
         }
@@ -425,6 +434,18 @@ var AutoFullTextMain = (function () {
 
   function selectedRegularItems(context) {
     return [...(context?.items || [])].filter((item) => AutoFullText.regularItem(item));
+  }
+
+  function showSISuccessNotice(win, description) {
+    try {
+      const notice = new Zotero.ProgressWindow({ window: win });
+      notice.show();
+      notice.changeHeadline("SI 已自动导入");
+      notice.addDescription(description);
+      notice.startCloseTimer(6000);
+    } catch (error) {
+      AutoFullText.log("Could not show the SI success notice", error);
+    }
   }
 
   function showSIRetryNotice(win, instruction) {

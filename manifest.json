@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Zotero PaperFlow",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "icons": {
     "48": "pane-icon.svg",
     "96": "pane-icon.svg"

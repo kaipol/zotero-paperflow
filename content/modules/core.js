@@ -11,9 +11,17 @@ var AutoFullText = (function () {
   };
   const trustedRemoteRoots = [
     "springer.com", "springernature.com", "nature.com", "els-cdn.com", "elsevier.com",
-    "figshare.com", "wiley.com", "oup.com", "pnas.org", "plos.org",
-    "rsc.org", "mdpi.com", "frontiersin.org", "tandfonline.com",
-    "sagepub.com", "acs.org", "iop.org", "cambridge.org",
+    "sciencedirect.com", "figshare.com", "wiley.com", "oup.com", "pnas.org", "plos.org",
+    "rsc.org", "rsc-cdn.org", "mdpi.com", "frontiersin.org", "tandfonline.com",
+    "sagepub.com", "acs.org", "iop.org", "cambridge.org", "science.org", "aaas.org",
+    "agu.org", "aps.org", "aip.org", "cell.com", "biomedcentral.com", "ieee.org",
+    "thelancet.com", "silverchair.com", "silverchair-cdn.com", "royalsocietypublishing.org",
+    "annualreviews.org", "worldscientific.com", "degruyter.com", "arxiv.org",
+    "biorxiv.org", "medrxiv.org", "chemrxiv.org", "nih.gov", "bmj.com", "nejm.org",
+    "jamanetwork.com", "asm.org", "ahajournals.org", "optica.org", "spiedigitallibrary.org",
+    "acm.org", "elifesciences.org", "embopress.org", "cshlp.org", "rupress.org",
+    "biologists.com", "beilstein-journals.org", "thieme-connect.com", "karger.com",
+    "liebertpub.com",
   ];
 
   function getPref(key) {
@@ -141,6 +149,7 @@ var AutoFullText = (function () {
     maxBytes = 30 * 1024 * 1024,
     maxRedirects = 5,
     noCache = false,
+    anon = true,
     onResponse = null,
   } = {}) {
     const articleRequest = !baseURL;
@@ -170,7 +179,7 @@ var AutoFullText = (function () {
           errorDelayMax: 0,
           noRetryOnThrottle: true,
           noCache,
-          anon: true,
+          anon,
           followRedirects: false,
           requestObserver(xhr) {
             const rejectOversized = () => {
@@ -238,10 +247,11 @@ var AutoFullText = (function () {
     headers = {},
     maxBytes = 30 * 1024 * 1024,
     noCache = false,
+    anon = true,
     onRawText = null,
     onResponse = null,
   } = {}) {
-    const result = await fetchTextResource(url, { signal, headers, maxBytes, noCache, onResponse });
+    const result = await fetchTextResource(url, { signal, headers, maxBytes, noCache, anon, onResponse });
     if (onRawText) await onRawText(result.text, result.responseURL);
     const doc = new DOMParser().parseFromString(result.text, "text/html");
     if (!doc.documentElement || doc.querySelector("parsererror")) throw new Error("Article page returned invalid HTML.");

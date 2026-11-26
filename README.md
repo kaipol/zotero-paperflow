@@ -20,6 +20,8 @@
 
 **0.3.12 SI 重试：**点击「导入 SI」直接从出版商获取，不再弹出来源选择框，也不再提供插件内本地文件导入。每次点击都可在上一任务结束后发起新请求；失败或网页窗口打开后不保留 SI 锁。失败记录区分 HTTP 拒绝、连接异常和处理阶段。
 
+**0.3.14 Cloudflare 质询窗口与自动导入（仿 Zotero Connector 流程）：**修复 Zotero 内置浏览器在 Cloudflare Turnstile（如 `challenges.cloudflare.com`、`brunhild.challenges.cloudflare.com`）下因 Cookie 隔离/追踪保护/UA 含 `Zotero/` 导致 `CORS request did not succeed (Status code: null)` 而无法跳过验证的问题。遇到 403 / Cloudflare 质询时自动弹出独立安全验证窗口（临时放行会话 Cookie、追踪保护与网络状态分区，并统一纯净 Firefox UA，关闭后自动还原全部偏好）；验证自动或手动通过后，自动提取文章页 SI 链接、在已验证会话内下载 SI 文件（必要时支持跨域会话回退与下载主机二次验证）、非 PDF 转 PDF、关闭窗口并自动导入为 Zotero 子附件。
+
 ## 功能与实现结构
 
 ```text
@@ -30,9 +32,11 @@ defaults/preferences/prefs.js        自动处理选项、供应商配置与自�
 prefpane.xhtml                      Zotero Settings 注册时插入的 pane host
 prefpane.js                         在 Settings sandbox 中通过 Services.obs 移交 pane root
 pane-icon.svg                       设置侧栏图标
+content/challenge-window.xhtml       独立出版商安全验证窗口（Cloudflare Turnstile / 人工验证）
+content/challenge-window.js          验证窗口会话控制、临时 Gecko 偏好恢复、自动/手动过检与会话内下载
 content/modules/core.js              偏好、条目、日志和附件公共操作
 content/modules/main.js              Zotero Notifier 新条目队列、设置 pane 与文库右键菜单
-content/modules/supporting-info.js   SI 链接发现、HTTPS/域名筛选、下载和 PDF 转换
+content/modules/supporting-info.js   SI 链接发现、质询窗口协同、会话内/回退下载和 PDF 转换
 content/modules/fulltext-translation.js
                                      正文清洗、逐段翻译/中文校验、失败中止与本地中间文件生命周期
 content/modules/translation-client.js
@@ -72,8 +76,8 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 1. 本插件只添加两个文献右键菜单：**导入 SI** 和 **生成全文翻译**。手动命令不依赖新增文献时的自动选项。
 2. 点击 **导入 SI** 直接从出版商获取第一份可识别的 SI，不弹来源选择框。有 DOI 时优先使用 DOI 解析地址，否则使用条目网址。多选时逐条处理。PDF 直接附加；受支持的非 PDF 文件在 Windows 上用 Microsoft Office 转换。只有 Zotero 返回已保存的子附件才报告完成。
-3. 单条导入遇到 HTTP 403 或识别出安全验证页时，打开或聚焦 Zotero 独立网页窗口，由用户在出版商页面按提示操作。单条手动请求遇到状态 0、超时或离线时，询问是否打开网页检查；后台遇到这些连接错误只给非模态提示，不阻断全文翻译。这类错误不等同于 Cloudflare。多选手动处理只给失败汇总，避免连续弹窗。
-4. 失败或打开网页后，SI 任务已结束。再次点击 **导入 SI** 会从文章页发起新请求，不复用上一次请求的本地 HTTP 缓存、工作区或失败状态。正在运行的同条目 SI 不会重复启动，全文翻译仍在运行不妨碍再次发起 SI。插件不读取验证后的页面、复用浏览会话或后台接管下载；如果出版商仍拒绝匿名请求，重新点击仍可能受阻。
+3. 导入遇到 HTTP 403 或识别出 Cloudflare / 安全验证页时，仿照 Zotero Connector 流程自动弹出独立安全验证窗口：窗口开启期间临时放行验证所需会话 Cookie、追踪保护及网络分区并统一 Firefox UA，支持自动跳过或手动点击验证框，通过后自动提取第一份 SI 链接并在当前已验证会话内下载（跨域回退至带会话 Cookie 的 HTTP 请求，下载主机若二次质询则在同一窗口完成验证）、转换 PDF、自动关闭窗口并导入子附件；窗口关闭后立即恢复原有 Zotero 偏好。用户也可在工具栏手动点击「已通过，立即提取 SI」或「取消」。单条手动请求遇到状态 0、超时或离线时，询问是否打开网页检查；后台遇到这些连接错误只给非模态提示，不阻断全文翻译。
+4. 失败或取消验证后，SI 任务立即释放锁。再次点击 **导入 SI** 会从文章页发起新请求，不复用上一次请求的本地 HTTP 缓存、工作区或失败状态；同一出版商已通过验证的会话 Cookie 可被后续请求自动复用。正在运行的同条目 SI 不会重复启动，全文翻译仍在运行不妨碍再次发起 SI。
 5. 失败保留 `si-error.txt` 与已有中间文件，记录处理阶段以及可取得的请求来源、HTTP 状态和 Gecko 通道状态。全文翻译失败会停止该手动批次；失败详情也可见于 Zotero Debug Output。
 
 ## 翻译服务配置
@@ -86,7 +90,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ## 安装与试用
 
-1. 用 7-Zip 将 `zotero-paperflow-0.3.13.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
+1. 用 7-Zip 将 `zotero-paperflow-0.3.14.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
 2. 在 Zotero 中选择 **工具 → 插件 → 齿轮 → Install Plugin From File…**，选取该 XPI，按提示重启 Zotero。
 3. 打开 **编辑 → 设置 → Zotero PaperFlow**，分别选择两个选项并保存。全文翻译需选择已配置的供应商、设置模型与密钥环境变量、保存或自定义系统提示词；SI 的非 PDF 转换需要 Windows 与可用的 Microsoft Office 组件。PowerPoint 的 PDF 导出可能显示 PowerPoint 窗口。
 4. 新增具有 DOI/网页 URL 的测试文献验证自动选项；已有文献可在文库中选中后右键，分别执行补抓 SI 或生成中文全文翻译。
@@ -99,18 +103,18 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ```bash
 node scripts/build-xpi.mjs
-node test/package-smoke.mjs ../zotero-paperflow-0.3.13.xpi
+node test/package-smoke.mjs ../zotero-paperflow-0.3.14.xpi
 ```
 
 ## 当前验证边界
 
 - 已用 `test/pdf-smoke.html` 经 Microsoft Edge headless 打印并查看 `test/pdf-smoke.pdf`：一页中文排版、MathML 公式、SVG 图片与链接均可见。
 - 已在 Node VM 中调用实际 `makeWebsitePdfPage()` 生成 `test/site-style-smoke.html`，再由 Edge 打印并查看 `test/site-style-smoke.pdf`：模拟出版商 CSS、标题、正文颜色、公式、内嵌图和链接均保留。
-- `node test/behavior-smoke.mjs` 在 VM 中验证多供应商、Cometix 模板/自定义提示词与旧端点迁移回退、环境变量密钥、HTTP/HTTPS URL 与安全重定向、响应限额及取消区分、在途请求取消、段落拆分/并发/中文门禁、SI 首文件、失败保留临时文件和卸载期间停止任务。
-- `node test/static-smoke.mjs` 检查模块清单、默认偏好、设置恢复/容量、请求限制、原始响应先保存、翻译门禁与导出顺序、Office 转换退出/清理路径；完整 JavaScript 语法、设置 XHTML 片段和 manifest JSON 另行检查。
-- `node test/package-smoke.mjs <XPI>` 验证归档完整性、版本与清单，并逐字节比较全部 14 个包内源文件；`node scripts/build-xpi.mjs` 从临时新归档构建，仅在版本包不存在时创建，创建后再次校验。
+- `node test/behavior-smoke.mjs` 在 VM 中验证多供应商、Cometix 模板/自定义提示词与旧端点迁移回退、环境变量密钥、HTTP/HTTPS URL 与安全重定向、响应限额及取消区分、在途请求取消、段落拆分/并发/中文门禁、SI 首文件、Cloudflare 质询窗口自动/手动通过与会话内下载/跨域回退/二次验证/取消恢复、失败保留临时文件和卸载期间停止任务。
+- `node test/static-smoke.mjs` 检查模块清单、默认偏好、设置恢复/容量、请求限制、质询窗口配置、原始响应先保存、翻译门禁与导出顺序、Office 转换退出/清理路径；完整 JavaScript 语法、XHTML 与 manifest JSON 另行检查。
+- `node test/package-smoke.mjs <XPI>` 验证归档完整性、版本与清单，并逐字节比较全部 16 个包内源文件；`node scripts/build-xpi.mjs` 从临时新归档构建，仅在版本包不存在时创建，创建后再次校验。
 - 本机 Microsoft Office COM 小样例实际转换已验证：Word `.txt`、Excel `.csv`、PowerPoint `.pptx` 均以退出码 0 生成带 `%PDF-` 文件头的 PDF；PowerPoint 自动化可能显示应用窗口。
 - 逐段字符门禁拒绝空译文、缺少中文的文本段、日文假名/韩文和词表能识别的部分繁体字符，并筛查明显未译原文与异常短输出；这些启发式不能证明句子语义完整或翻译准确。其余未覆盖项包括 Zotero XUL `nsIWebBrowserPrint` 的版本兼容、插件安装、真实网站正文提取、真实 API 请求、Office 对损坏/受保护文件的自动化行为、Zotero 附件导入或其他 Office 版本对 ODF/图片的兼容性。
-- SI 重试、403 窗口转交、状态 0 诊断和每次请求不使用本地 HTTP 缓存均用 VM 模拟验证。未在实际 Zotero 或出版商站点执行整套流程。浏览器内验证不保证随后的匿名请求能访问页面；新版本不提供本地文件导入或后台验证下载回退。
+- SI 重试、Cloudflare 质询窗口自动/手动跳过、会话内下载、二次验证、状态 0 诊断和每次请求不使用本地 HTTP 缓存均用 VM 模拟验证。未在实际 Zotero 或出版商站点执行整套流程。
 - 为避免影响日常 Zotero 库，本项目不启动 Zotero 做测试。动态渲染且只通过 JavaScript 加载正文的期刊页目前不能保证提取成功；插件遇到失败时不创建翻译附件。
 - PDF 会尽量沿用对应网页样式表、正文容器和内联样式，但浏览器打印分页和网页屏幕布局存在差异，不承诺与任何现有「全文翻译」附件逐页像素级一致；不依赖旧附件模板源码。

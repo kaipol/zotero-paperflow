@@ -32,6 +32,8 @@ const expected = [
   "prefpane.js",
   "pane-icon.svg",
   "defaults/preferences/prefs.js",
+  "content/challenge-window.xhtml",
+  "content/challenge-window.js",
   "content/office-to-pdf.vbs",
   "content/modules/core.js",
   "content/modules/fulltext-translation.js",

@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<!DOCTYPE window>
+<window
+  id="zotero-auto-fulltext-challenge-window"
+  title="Zotero PaperFlow — 出版商安全验证"
+  width="980"
+  height="740"
+  xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+  xmlns:html="http://www.w3.org/1999/xhtml">
+  <vbox flex="1" style="display:flex;flex-direction:column;width:100%;height:100%;margin:0;padding:0;overflow:hidden;">
+    <html:div
+      id="si-challenge-toolbar"
+      style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid color-mix(in srgb,currentColor 18%,transparent);font-family:system-ui,-apple-system,'Segoe UI',sans-serif;font-size:13px;flex:0 0 auto;">
+      <html:div style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1 1 auto;">
+        <html:div id="si-challenge-status" style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          正在加载出版商页面…
+        </html:div>
+        <html:div id="si-challenge-url" style="font-size:11px;opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"/>
+      </html:div>
+      <html:button id="si-challenge-reload" type="button" style="flex:0 0 auto;padding:4px 10px;cursor:pointer;">
+        刷新
+      </html:button>
+      <html:button id="si-challenge-extract" type="button" style="flex:0 0 auto;padding:4px 10px;cursor:pointer;">
+        已通过，立即提取 SI
+      </html:button>
+      <html:button id="si-challenge-cancel" type="button" style="flex:0 0 auto;padding:4px 10px;cursor:pointer;">
+        取消
+      </html:button>
+    </html:div>
+    <browser
+      id="si-challenge-browser"
+      type="content"
+      primary="true"
+      remote="false"
+      flex="1"
+      disableglobalhistory="true"
+      style="flex:1 1 auto;width:100%;height:100%;min-height:0;border:0;"/>
+  </vbox>
+  <html:script src="chrome://zotero-auto-fulltext/content/challenge-window.js"/>
+</window>

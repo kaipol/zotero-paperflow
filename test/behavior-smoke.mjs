@@ -458,10 +458,12 @@ const supportContext = {
     itemURL: () => "https://doi.org/10.1039/d6ee05315g",
     safeName: (name) => name,
     log: () => {},
+    validateArticleURL: core.validateArticleURL,
     validateResourceURL: core.validateResourceURL,
     validateRedirectURL: core.validateRedirectURL,
     fetchDocument: async (url, options) => {
       assert.equal(options.noCache, true, "each SI attempt requests a fresh article page");
+      assert.equal(options.anon, false, "SI article fetches should reuse verified session cookies");
       siArticleRequests.push(url);
       if (publisherResponseError) {
         options.onResponse(publisherResponseError, siPublisherURL);
@@ -494,7 +496,7 @@ const supportContext = {
     HTTP: {
       request: async (_method, url, options) => {
         assert.ok(siWorkspaceFiles.has("si-source-article.html"), "save the article page before downloading the SI file");
-        assert.equal(options.anon, true);
+        assert.equal(options.anon, false);
         assert.equal(options.followRedirects, false);
         downloadedURLs.push(url);
         downloadedReferers.push(options.headers.Referer);
@@ -604,7 +606,7 @@ assert.match(siWorkspaceFiles.get("si-error.txt"), /cancelled/);
 
 const siItem = { id: 12, libraryID: 1, getAttachments: () => [1] };
 const downloadFirstSI = async (_method, url, options) => {
-  assert.equal(options.anon, true, "SI requests must remain anonymous");
+  assert.equal(options.anon, false, "SI downloads should reuse verified session cookies");
   assert.equal(options.noCache, true, "a new attempt must fetch the SI file without the local HTTP cache");
   downloadedURLs.push(url);
   return {
@@ -709,6 +711,534 @@ assert.deepEqual(downloadedURLs.slice(downloadsBeforeRetry), [
 assert.equal(importedAttachments.length, importsBeforeRetry + 1);
 assert.equal(importedAttachments.at(-1).parentItemID, retrySIItem.id);
 assert.equal(siWorkspaceCleaned, true);
+
+// --- Zotero Connector-style Challenge Window end-to-end VM tests ---
+{
+  const prefStore = new Map([
+    ["network.cookie.cookieBehavior", { type: "int", value: 4, userSet: true }],
+    ["privacy.partition.network_state", { type: "bool", value: true, userSet: false }],
+    ["privacy.firstparty.isolate", { type: "bool", value: false, userSet: false }],
+    ["privacy.trackingprotection.enabled", { type: "bool", value: true, userSet: true }],
+    ["privacy.trackingprotection.pbmode.enabled", { type: "bool", value: true, userSet: false }],
+    ["privacy.trackingprotection.socialtracking.enabled", { type: "bool", value: true, userSet: false }],
+    ["privacy.trackingprotection.fingerprinting.enabled", { type: "bool", value: true, userSet: false }],
+    ["privacy.trackingprotection.cryptomining.enabled", { type: "bool", value: true, userSet: false }],
+    ["privacy.annotate_channels.strict_list.enabled", { type: "bool", value: true, userSet: false }],
+    ["network.http.referer.XOriginPolicy", { type: "int", value: 2, userSet: true }],
+    ["network.http.sendRefererHeader", { type: "int", value: 1, userSet: false }],
+    ["dom.storage.enabled", { type: "bool", value: true, userSet: false }],
+    ["javascript.enabled", { type: "bool", value: true, userSet: false }],
+  ]);
+  const clearedPrefs = [];
+  const grantedCookieOrigins = [];
+  const activeObservers = new Map();
+  const mockServices = {
+    prefs: {
+      prefHasUserValue: (name) => Boolean(prefStore.get(name)?.userSet),
+      getIntPref: (name, fallback) => prefStore.has(name) ? prefStore.get(name).value : fallback,
+      getBoolPref: (name, fallback) => prefStore.has(name) ? prefStore.get(name).value : fallback,
+      setIntPref: (name, value) => prefStore.set(name, { type: "int", value, userSet: true }),
+      setBoolPref: (name, value) => prefStore.set(name, { type: "bool", value, userSet: true }),
+      clearUserPref: (name) => {
+        clearedPrefs.push(name);
+        if (name === "privacy.partition.network_state") prefStore.set(name, { type: "bool", value: true, userSet: false });
+        if (name === "privacy.trackingprotection.pbmode.enabled") prefStore.set(name, { type: "bool", value: true, userSet: false });
+        if (name === "privacy.trackingprotection.socialtracking.enabled") prefStore.set(name, { type: "bool", value: true, userSet: false });
+        if (name === "privacy.trackingprotection.fingerprinting.enabled") prefStore.set(name, { type: "bool", value: true, userSet: false });
+        if (name === "privacy.trackingprotection.cryptomining.enabled") prefStore.set(name, { type: "bool", value: true, userSet: false });
+        if (name === "privacy.annotate_channels.strict_list.enabled") prefStore.set(name, { type: "bool", value: true, userSet: false });
+        if (name === "network.http.sendRefererHeader") prefStore.set(name, { type: "int", value: 1, userSet: false });
+      },
+    },
+    perms: {
+      ALLOW_ACTION: 1,
+      EXPIRE_SESSION: 1,
+      addFromPrincipal: (principal, type) => {
+        if (type === "cookie") grantedCookieOrigins.push(principal.origin);
+      },
+    },
+    scriptSecurityManager: {
+      getSystemPrincipal: () => ({ isSystem: true }),
+      createContentPrincipalFromOrigin: (origin) => ({ origin }),
+    },
+    obs: {
+      addObserver: (obs, topic) => {
+        if (!activeObservers.has(topic)) activeObservers.set(topic, new Set());
+        activeObservers.get(topic).add(obs);
+      },
+      removeObserver: (obs, topic) => { activeObservers.get(topic)?.delete(obs); },
+    },
+  };
+  const observerCount = (topic) => activeObservers.get(topic)?.size || 0;
+
+  const makeMockChallengeDialog = (scriptBehavior) => (chromeURL, _name, _features, wrappedArgs) => {
+    assert.equal(chromeURL, "chrome://zotero-auto-fulltext/content/challenge-window.xhtml");
+    const listeners = new Map();
+    const browserListeners = new Map();
+    const buttonListeners = new Map();
+    let progressListener = null;
+    let windowClosed = false;
+    const statusEl = { textContent: "" };
+    const urlEl = { textContent: "" };
+    const makeBtn = (id) => ({
+      addEventListener: (type, fn) => buttonListeners.set(`${id}:${type}`, fn),
+      click: () => buttonListeners.get(`${id}:click`)?.(),
+    });
+    const reloadBtn = makeBtn("reload");
+    const extractBtn = makeBtn("extract");
+    const cancelBtn = makeBtn("cancel");
+    const browser = {
+      browsingContext: { customUserAgent: "" },
+      docShell: {
+        allowJavascript: false,
+        allowImages: false,
+        allowSubframes: false,
+        allowMetaRedirects: false,
+        allowAuth: false,
+        allowWindowControl: false,
+        allowMedia: false,
+        allowDNSPrefetch: false,
+      },
+      currentURI: { spec: "about:blank" },
+      contentDocument: null,
+      contentWindow: null,
+      addEventListener: (type, fn) => {
+        if (!browserListeners.has(type)) browserListeners.set(type, []);
+        browserListeners.get(type).push(fn);
+      },
+      addProgressListener: (listener) => { progressListener = listener; },
+      removeProgressListener: () => { progressListener = null; },
+      fixupAndLoadURIString: (url) => {
+        browser.currentURI = { spec: url };
+        scriptBehavior.onNavigate({
+          url,
+          browser,
+          statusEl,
+          cancelBtn,
+          extractBtn,
+          progressListener: () => progressListener,
+          fireLoad: () => (browserListeners.get("load") || []).forEach((fn) => fn()),
+          fireLocation: (newURL) => {
+            browser.currentURI = { spec: newURL };
+            progressListener?.onLocationChange(null, null, { spec: newURL });
+          },
+          isClosed: () => windowClosed,
+        });
+      },
+      setAttribute: () => {},
+    };
+    const dialogWindow = {
+      arguments: [wrappedArgs],
+      addEventListener: (type, fn) => {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+      },
+      close: () => {
+        if (windowClosed) return;
+        windowClosed = true;
+        (listeners.get("unload") || []).forEach((fn) => fn());
+      },
+      focus: () => {},
+    };
+    const dialogContext = {
+      window: dialogWindow,
+      document: {
+        readyState: "complete",
+        getElementById: (id) => ({
+          "si-challenge-status": statusEl,
+          "si-challenge-url": urlEl,
+          "si-challenge-reload": reloadBtn,
+          "si-challenge-extract": extractBtn,
+          "si-challenge-cancel": cancelBtn,
+          "si-challenge-browser": browser,
+        })[id] || null,
+      },
+      Services: mockServices,
+      Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+      URL,
+      Uint8Array,
+      AbortController,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      clearTimeout,
+      Date,
+    };
+    vm.createContext(dialogContext);
+    vm.runInContext(read("content/challenge-window.js"), dialogContext);
+    return dialogWindow;
+  };
+
+  // Verify clean Firefox UA helper and JSD non-false-positive
+  const challengeImports = [];
+  const challengeWorkspaceFiles = new Map();
+  let challengeWorkspaceCleaned = false;
+  let dialogScenario = null;
+  let httpDownloadHandler = null;
+  const challengeSupportContext = {
+    AutoFullText: {
+      itemURL: () => "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g",
+      safeName: (name) => name,
+      log: () => {},
+      validateArticleURL: core.validateArticleURL,
+      validateResourceURL: core.validateResourceURL,
+      validateRedirectURL: core.validateRedirectURL,
+      isLocalHost: core.isLocalHost,
+      isIPAddress: core.isIPAddress,
+      fetchDocument: async (url, options) => {
+        const err = Object.assign(new Error("HTTP 403"), {
+          status: 403,
+          xmlhttp: { getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "" },
+        });
+        options.onResponse(err, url);
+        throw err;
+      },
+    },
+    AutoFullTextPdf: {
+      createWorkspace: async () => {
+        challengeWorkspaceCleaned = false;
+        return {
+          path: "workspace/cf-test",
+          file: (name) => `workspace/${name}`,
+          writeText: async (name, contents) => { challengeWorkspaceFiles.set(name, contents); },
+          cleanup: async () => { challengeWorkspaceCleaned = true; },
+        };
+      },
+      convertToPdf: async (path) => path,
+    },
+    Zotero: {
+      getMainWindow: () => ({
+        navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Zotero/10.0.8" },
+        openDialog: (...args) => makeMockChallengeDialog(dialogScenario)(...args),
+      }),
+      HTTP: {
+        request: async (method, url, options) => httpDownloadHandler(method, url, options),
+      },
+      Utilities: { randomString: () => "cf1" },
+      Items: { get: () => null },
+      Attachments: {
+        importFromFile: async (att) => {
+          challengeImports.push(att);
+          return { id: challengeImports.length };
+        },
+      },
+      File: {
+        pathToFile: (path) => ({ path, leafName: path.split("/").pop(), fileSize: challengeWorkspaceFiles.get(path)?.length || 0 }),
+      },
+    },
+    URL,
+    TextDecoder,
+    TextEncoder,
+    Uint8Array,
+    OS: {
+      File: { writeAtomic: async (path, bytes) => { challengeWorkspaceFiles.set(path, bytes); } },
+    },
+  };
+  vm.createContext(challengeSupportContext);
+  vm.runInContext(read("content/modules/supporting-info.js"), challengeSupportContext);
+  const siMod = challengeSupportContext.AutoFullTextSupportingInfo;
+
+  assert.equal(
+    siMod.getBrowserUserAgent(),
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "challenge window and SI HTTP should strip Zotero token and present a consistent Firefox UA",
+  );
+  // Verified article page with passive Cloudflare JSD script must NOT be mistaken for a challenge page
+  assert.equal(
+    siMod.isChallengeDocument({
+      title: "High-Efficiency Perovskite Solar Cells",
+      documentElement: { outerHTML: '<html><head><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></head><body><a href="/suppdata/d6ee05315g1.pdf">Supplementary Information</a></body></html>' },
+      querySelector: () => null,
+    }, "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g"),
+    false,
+    "passive Cloudflare JSD script on an article page must not trigger infinite challenge loop",
+  );
+  // Active Turnstile challenge page MUST be detected
+  assert.equal(
+    siMod.isChallengeDocument({
+      title: "Just a moment...",
+      documentElement: { outerHTML: '<html><body><div id="challenge-running"></div></body></html>' },
+      querySelector: (sel) => sel.includes("#challenge-running") ? {} : null,
+    }, "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g"),
+    true,
+  );
+
+  // Scenario A: 403 -> Challenge window opens -> Turnstile clears -> in-window fetch downloads PDF -> prefs restored -> imported
+  let inWindowFetchCalled = 0;
+  let observedDialogUA = "";
+  let observedChannelUA = "";
+  dialogScenario = {
+    onNavigate({ browser, fireLoad, fireLocation }) {
+      observedDialogUA = browser.browsingContext.customUserAgent;
+      assert.equal(prefStore.get("network.cookie.cookieBehavior").value, 0, "challenge window should allow cookies while open");
+      assert.equal(prefStore.get("privacy.partition.network_state").value, false, "challenge window should disable network state partitioning while open");
+      assert.equal(prefStore.get("privacy.trackingprotection.enabled").value, false, "challenge window should disable tracking protection while open");
+      assert.ok(grantedCookieOrigins.includes("https://challenges.cloudflare.com"), "should grant session cookie perm for challenges.cloudflare.com");
+      assert.ok(grantedCookieOrigins.includes("https://brunhild.challenges.cloudflare.com"), "should grant session cookie perm for brunhild.challenges.cloudflare.com");
+      assert.equal(observerCount("http-on-modify-request"), 1, "should attach http-on-modify-request UA observer while open");
+      assert.equal(observerCount("quit-application-granted"), 1, "should attach quit-application pref-restore observer while open");
+      const mockChannel = {
+        URI: { scheme: "https", host: "brunhild.challenges.cloudflare.com" },
+        setRequestHeader: (name, value) => { if (name === "User-Agent") observedChannelUA = value; },
+      };
+      let localChannelCancelled = false;
+      const localZoteroChannel = {
+        URI: { scheme: "http", host: "127.0.0.1" },
+        loadInfo: { browsingContext: browser.browsingContext },
+        cancel: () => { localChannelCancelled = true; },
+        setRequestHeader: () => {},
+      };
+      for (const obs of activeObservers.get("http-on-modify-request") || []) {
+        obs.observe(mockChannel, "http-on-modify-request");
+        obs.observe(localZoteroChannel, "http-on-modify-request");
+      }
+      assert.equal(localChannelCancelled, true, "challenge browser must block requests to loopback/local Zotero endpoints");
+      // First load: Cloudflare Turnstile challenge page
+      browser.contentDocument = {
+        title: "Just a moment...",
+        readyState: "complete",
+        body: { children: [{}], textContent: "Checking your browser..." },
+        documentElement: { outerHTML: '<html><body><iframe src="https://challenges.cloudflare.com/turnstile"></iframe></body></html>' },
+        querySelector: (sel) => sel.includes("challenges.cloudflare.com") ? {} : null,
+        querySelectorAll: () => [],
+      };
+      fireLoad();
+      // After challenge passes (auto or manual), navigate to real article page
+      setTimeout(() => {
+        browser.contentDocument = {
+          title: "Article Title - RSC",
+          readyState: "complete",
+          body: { children: [{}], textContent: "Full article content with supporting info link." },
+          documentElement: { outerHTML: '<html><body><a href="/en/content/articlepdf/2026/ee/d6ee05315g-si.pdf">Electronic Supplementary Information</a></body></html>' },
+          querySelector: () => null,
+          querySelectorAll: () => [siAnchor("/en/content/articlepdf/2026/ee/d6ee05315g-si.pdf", "Electronic Supplementary Information")],
+        };
+        browser.contentWindow = {
+          AbortController,
+          fetch: async (url, init) => {
+            inWindowFetchCalled += 1;
+            assert.equal(init.credentials, "include", "in-window download must include verified session cookies");
+            return {
+              status: 200,
+              url,
+              headers: { get: (k) => k.toLowerCase() === "content-type" ? "application/pdf" : "" },
+              arrayBuffer: async () => new TextEncoder().encode("%PDF-1.7 verified-in-window").buffer,
+            };
+          },
+        };
+        fireLocation("https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g");
+        fireLoad();
+      }, 25);
+    },
+  };
+  const scenarioAResult = await siMod.addForItem({ id: 201, getAttachments: () => [] });
+  assert.equal(scenarioAResult.skipped, false);
+  assert.equal(scenarioAResult.usedChallengeWindow, true);
+  assert.equal(inWindowFetchCalled, 1);
+  assert.equal(observedDialogUA, "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0");
+  assert.equal(observedChannelUA, observedDialogUA, "brunhild.challenges.cloudflare.com requests must receive the consistent Firefox UA");
+  assert.equal(challengeImports.length, 1);
+  assert.equal(challengeImports[0].parentItemID, 201);
+  assert.equal(challengeWorkspaceCleaned, true);
+  // Verify ALL temporary Gecko prefs and observers were restored upon window close
+  assert.equal(prefStore.get("network.cookie.cookieBehavior").value, 4, "cookieBehavior must be restored on close");
+  assert.equal(prefStore.get("privacy.partition.network_state").value, true, "partition.network_state must be restored on close");
+  assert.equal(prefStore.get("privacy.trackingprotection.enabled").value, true, "trackingprotection must be restored on close");
+  assert.equal(prefStore.get("network.http.referer.XOriginPolicy").value, 2, "XOriginPolicy must be restored on close");
+  assert.equal(observerCount("http-on-modify-request"), 0, "http-on-modify-request observer must be removed on close");
+  assert.equal(observerCount("http-on-examine-response"), 0, "http-on-examine-response observer must be removed on close");
+  assert.equal(observerCount("quit-application-granted"), 0, "quit-application observer must be removed on close");
+
+  // Scenario B: In-window fetch hits CORS -> falls back to session-cookie HTTP download (anon: false + matched UA)
+  let fallbackDownloadCalled = 0;
+  httpDownloadHandler = async (_method, url, options) => {
+    fallbackDownloadCalled += 1;
+    assert.equal(options.anon, false, "fallback SI download must reuse session cookies");
+    assert.equal(options.headers["User-Agent"], observedDialogUA, "fallback SI download must use the same Firefox UA");
+    options.cancellerReceiver(() => {});
+    options.requestObserver({ addEventListener: () => {} });
+    return {
+      status: 200,
+      response: new TextEncoder().encode("%PDF-1.7 session-fallback"),
+      responseURL: url,
+      getResponseHeader: (name) => name === "Content-Type" ? "application/pdf" : "",
+    };
+  };
+  dialogScenario = {
+    onNavigate({ browser, fireLoad }) {
+      browser.contentDocument = {
+        title: "Article Title - RSC",
+        readyState: "complete",
+        body: { children: [{}], textContent: "Verified article body with cross-origin SI CDN link." },
+        documentElement: { outerHTML: '<html><body><a href="https://static-content.springer.com/esm/si.pdf">Supplementary Information</a></body></html>' },
+        querySelector: () => null,
+        querySelectorAll: () => [siAnchor("https://static-content.springer.com/esm/si.pdf", "Supplementary Information")],
+      };
+      browser.contentWindow = {
+        AbortController,
+        fetch: async () => { throw new TypeError("NetworkError when attempting to fetch resource."); },
+      };
+      fireLoad();
+    },
+  };
+  const scenarioBResult = await siMod.addForItem({ id: 202, getAttachments: () => [] });
+  assert.equal(scenarioBResult.usedChallengeWindow, true);
+  assert.equal(fallbackDownloadCalled, 1);
+  assert.equal(challengeImports.length, 2);
+
+  // Scenario C: Secondary Cloudflare challenge on SI host -> navigates same window -> retries download -> imports
+  let navCount = 0;
+  let secondaryAttempts = 0;
+  httpDownloadHandler = async () => {
+    secondaryAttempts += 1;
+    throw Object.assign(new Error("HTTP 403"), {
+      status: 403,
+      xmlhttp: { getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "" },
+    });
+  };
+  dialogScenario = {
+    onNavigate({ url, browser, fireLoad }) {
+      navCount += 1;
+      if (navCount === 1) {
+        browser.contentDocument = {
+          title: "Article Page",
+          readyState: "complete",
+          body: { children: [{}], textContent: "Verified article page." },
+          documentElement: { outerHTML: '<html><body><a href="https://static-content.springer.com/esm/secondary-si.pdf">Supplementary Information</a></body></html>' },
+          querySelector: () => null,
+          querySelectorAll: () => [siAnchor("https://static-content.springer.com/esm/secondary-si.pdf", "Supplementary Information")],
+        };
+        browser.contentWindow = {
+          AbortController,
+          fetch: async () => {
+            if (navCount < 2) throw new TypeError("CORS blocked before secondary challenge");
+            return {
+              status: 200,
+              url: "https://static-content.springer.com/esm/secondary-si.pdf",
+              headers: { get: (k) => k.toLowerCase() === "content-type" ? "application/pdf" : "" },
+              arrayBuffer: async () => new TextEncoder().encode("%PDF-1.7 after-secondary").buffer,
+            };
+          },
+        };
+        fireLoad();
+      } else {
+        assert.equal(url, "https://static-content.springer.com/esm/secondary-si.pdf");
+        browser.contentDocument = {
+          title: "Secondary Host Verified",
+          readyState: "complete",
+          body: { children: [{}], textContent: "Secondary challenge cleared." },
+          documentElement: { outerHTML: "<html><body>Verified</body></html>" },
+          querySelector: () => null,
+          querySelectorAll: () => [],
+        };
+        fireLoad();
+      }
+    },
+  };
+  const scenarioCResult = await siMod.addForItem({ id: 203, getAttachments: () => [] });
+  assert.equal(scenarioCResult.usedChallengeWindow, true);
+  assert.equal(navCount, 2, "secondary CF challenge should navigate the same window to the SI host");
+  assert.equal(secondaryAttempts, 1);
+  assert.equal(challengeImports.length, 3);
+
+  // Scenario D: User clicks Cancel in the challenge window -> rejects with SupportingInfoChallengeCancelledError, restores prefs, cleans workspace
+  dialogScenario = {
+    onNavigate({ cancelBtn }) {
+      setTimeout(() => cancelBtn.click(), 10);
+    },
+  };
+  await assert.rejects(
+    siMod.addForItem({ id: 204, getAttachments: () => [] }),
+    (error) => error.name === "SupportingInfoChallengeCancelledError",
+  );
+  assert.equal(prefStore.get("network.cookie.cookieBehavior").value, 4, "prefs must be restored even on user cancel");
+  assert.equal(observerCount("http-on-modify-request"), 0, "HTTP observer must be removed on user cancel");
+  assert.equal(challengeWorkspaceCleaned, true, "cancelling challenge window must not leak orphaned temp directories");
+
+  // Scenario E: Bare ACS/Wiley /doi/suppl/<doi> HTML landing link skipped in favor of real SI PDF; login page stays open until article loads
+  const acsDoc = {
+    querySelectorAll: () => [
+      siAnchor("/doi/suppl/10.1021/jacs.12345", "Supporting Information"),
+      siAnchor("/doi/suppl/10.1021/jacs.12345/suppl_file/ja_si_001.pdf", "ja_si_001.pdf"),
+    ],
+  };
+  assert.equal(
+    siMod.extractSupportingLink(acsDoc, "https://pubs.acs.org/doi/10.1021/jacs.12345")?.url,
+    "https://pubs.acs.org/doi/suppl/10.1021/jacs.12345/suppl_file/ja_si_001.pdf",
+    "bare /doi/suppl/<doi> HTML index links must be skipped when a real SI file link is present",
+  );
+
+  // Scenario F: Secondary host returns Content-Disposition: attachment -> http-on-examine-response cancels Save As & downloads via downloadBounded
+  let secondarySaveAsCancelled = false;
+  let secondaryHttpAttempts = 0;
+  httpDownloadHandler = async (_method, url, options) => {
+    secondaryHttpAttempts += 1;
+    if (secondaryHttpAttempts === 1) {
+      throw Object.assign(new Error("HTTP 403"), {
+        status: 403,
+        xmlhttp: { getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "" },
+      });
+    }
+    options.cancellerReceiver(() => {});
+    options.requestObserver({ addEventListener: () => {} });
+    return {
+      status: 200,
+      response: new TextEncoder().encode("%PDF-1.7 attachment-secondary"),
+      responseURL: url,
+      getResponseHeader: (name) => name === "Content-Type" ? "application/pdf" : 'attachment; filename="si-attachment.pdf"',
+    };
+  };
+  let fNavCount = 0;
+  dialogScenario = {
+    onNavigate({ url, browser, fireLoad, isClosed }) {
+      fNavCount += 1;
+      if (fNavCount === 1) {
+        // First show an institutional login page -> window must remain open!
+        browser.contentDocument = {
+          title: "Institutional Sign In",
+          readyState: "complete",
+          body: { children: [{}], textContent: "Please sign in with your institution." },
+          documentElement: { outerHTML: '<html><body><input type="password"/></body></html>' },
+          querySelector: (sel) => sel.includes('input[type="password"]') ? {} : null,
+          querySelectorAll: () => [],
+        };
+        fireLoad();
+        assert.equal(isClosed(), false, "login page must not auto-close the challenge window");
+        setTimeout(() => {
+          browser.contentDocument = {
+            title: "Verified Article",
+            readyState: "complete",
+            body: { children: [{}], textContent: "Article with cross-origin SI." },
+            documentElement: { outerHTML: '<html><body><a href="https://static-content.springer.com/esm/att-si.pdf">Supplementary Information</a></body></html>' },
+            querySelector: () => null,
+            querySelectorAll: () => [siAnchor("https://static-content.springer.com/esm/att-si.pdf", "Supplementary Information")],
+          };
+          browser.contentWindow = { AbortController, fetch: async () => { throw new Error("should not call fetchInWindow cross-origin"); } };
+          fireLoad();
+        }, 20);
+      } else {
+        assert.equal(url, "https://static-content.springer.com/esm/att-si.pdf");
+        const attChannel = {
+          URI: { spec: url, host: "static-content.springer.com" },
+          responseStatus: 200,
+          getResponseHeader: (h) => ({
+            "content-disposition": 'attachment; filename="att-si.pdf"',
+            "content-type": "application/pdf",
+          })[h.toLowerCase()] || "",
+          cancel: () => { secondarySaveAsCancelled = true; },
+        };
+        for (const obs of activeObservers.get("http-on-examine-response") || []) {
+          obs.observe(attChannel, "http-on-examine-response");
+        }
+      }
+    },
+  };
+  const scenarioFResult = await siMod.addForItem({ id: 205, getAttachments: () => [] });
+  assert.equal(scenarioFResult.usedChallengeWindow, true);
+  assert.equal(secondarySaveAsCancelled, true, "secondary attachment response should cancel browser Save As dialog and hand off to downloadBounded");
+  assert.equal(secondaryHttpAttempts, 2);
+  assert.equal(challengeImports.length, 4);
+}
 
 let releaseDelay;
 let notifierObserver;
@@ -920,6 +1450,22 @@ releaseManualSI({ skipped: false });
 await flushManual();
 assert.match(manualAlerts.at(-1), /完成 1 项/);
 deferTranslation = false;
+
+manualSIError = Object.assign(new Error("已取消安全验证，SI 尚未导入。"), {
+  name: "SupportingInfoChallengeCancelledError",
+  publisherURL: siPublisherURL,
+});
+const viewersBeforeCancel = viewerCalls.length;
+const callsBeforeCancel = manualSICalls;
+await clickImport();
+assert.match(manualAlerts.at(-1), /补处理已取消/);
+assert.equal(viewerCalls.length, viewersBeforeCancel, "cancelling the challenge window must not open another viewer window");
+manualSIError = null;
+await clickImport();
+assert.equal(manualSICalls, callsBeforeCancel + 2, "cancelling the challenge window must release the SI lock immediately");
+releaseManualSI({ skipped: false, usedChallengeWindow: true });
+await flushManual();
+assert.match(manualAlerts.at(-1), /完成 1 项/);
 
 const callsBeforeTranslation = manualSICalls;
 const translationsBeforeMenu = translatedItems.length;
