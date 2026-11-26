@@ -1569,6 +1569,269 @@ assert.equal(siWorkspaceCleaned, true);
     await new Promise((resolve) => setTimeout(resolve, 520));
     assert.equal(autoVerified, true, "verified article with hidden navbar password input and Xray-throwing hasSupportingLink must still auto-extract");
   }
+
+  // Scenario K: Zotero 10 remote / COOP browser where browser.contentDocument is null,
+  // using browsingContext.currentWindowGlobal.documentURI + PageData JSWindowActor
+  {
+    const statusHistory = [];
+    const statusEl = {
+      _text: "",
+      get textContent() { return this._text; },
+      set textContent(v) { this._text = v; statusHistory.push(v); },
+    };
+    const urlEl = { textContent: "" };
+    const noopBtn = () => ({ addEventListener: () => {} });
+    let phase = "challenge";
+    let actorVerifiedPayload = null;
+    const articleURL = "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g";
+    const challengeHTML = '<html><head><title>Just a moment...</title></head><body><div id="challenge-running">Checking your browser</div></body></html>';
+    const verifiedHTML = '<html><head><title>Suppressing interfacial recombination</title><meta name="citation_doi" content="10.1039/d6ee05315g"/></head><body><div class="article__section"><a class="list__item-link" href="/en/content/datafile/2026/ee/d6ee05315g/si1">Supplementary information</a></div></body></html>';
+    const actorBrowser = {
+      browsingContext: {
+        customUserAgent: "",
+        currentWindowGlobal: {
+          documentURI: { spec: articleURL },
+          getActor: (name) => name === "PageData" ? {
+            sendQuery: async (query) => {
+              if (query === "title") return phase === "challenge" ? "Just a moment..." : "Suppressing interfacial recombination";
+              if (query === "documentHTML") return phase === "challenge" ? challengeHTML : verifiedHTML;
+              return null;
+            },
+          } : null,
+        },
+      },
+      docShell: null,
+      currentURI: null,
+      contentDocument: null,
+      contentWindow: null,
+      addEventListener: () => {},
+      addProgressListener: () => {},
+      removeProgressListener: () => {},
+      fixupAndLoadURIString: () => {},
+      setAttribute: () => {},
+    };
+    const actorSession = {
+      url: "https://doi.org/10.1039/d6ee05315g",
+      userAgent: "Mozilla/5.0 Firefox/140.0",
+      hasSupportingLink: () => false,
+      hasSupportingLinkHTML: (htmlText) => htmlText.includes("/en/content/datafile/2026/ee/d6ee05315g/si1"),
+      onVerified: async (payload) => { actorVerifiedPayload = payload; return { ok: true }; },
+      resolve: () => {},
+      reject: () => {},
+    };
+    const actorContext = {
+      window: {
+        location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=actor1" },
+        arguments: [{ wrappedJSObject: actorSession }],
+        addEventListener: () => {},
+        close: () => {},
+      },
+      document: {
+        readyState: "complete",
+        getElementById: (id) => ({
+          "si-challenge-status": statusEl,
+          "si-challenge-url": urlEl,
+          "si-challenge-reload": noopBtn(),
+          "si-challenge-extract": noopBtn(),
+          "si-challenge-cancel": noopBtn(),
+          "si-challenge-browser": actorBrowser,
+        })[id] || null,
+      },
+      Services: mockServices,
+      Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+      URL,
+      Uint8Array,
+      AbortController,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      clearTimeout,
+      Date,
+    };
+    vm.createContext(actorContext);
+    vm.runInContext(read("content/challenge-window.js"), actorContext);
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    assert.ok(
+      statusHistory.some((s) => /Cloudflare|安全验证/.test(s)),
+      `challenge status must update via PageData actor even when contentDocument is null (got: ${statusHistory.join(" | ")})`,
+    );
+    assert.equal(actorVerifiedPayload, null, "must not extract while Cloudflare challenge is active");
+    phase = "verified";
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    assert.ok(actorVerifiedPayload, "must automatically extract SI via PageData actor once challenge clears");
+    assert.equal(actorVerifiedPayload.responseURL, articleURL);
+    assert.equal(actorVerifiedPayload.source, "pagedata-actor");
+    assert.ok(actorVerifiedPayload.html.includes("/en/content/datafile/2026/ee/d6ee05315g/si1"));
+  }
+
+  // Scenario L: Article-mode http-on-examine-response updates status when both contentDocument and PageData are unavailable
+  {
+    const observedTopics = new Map();
+    const obsServices = {
+      ...mockServices,
+      obs: {
+        addObserver: (observer, topic) => observedTopics.set(topic, observer),
+        removeObserver: (_observer, topic) => observedTopics.delete(topic),
+      },
+    };
+    const statusHistory = [];
+    const statusEl = {
+      _text: "",
+      get textContent() { return this._text; },
+      set textContent(v) { this._text = v; statusHistory.push(v); },
+    };
+    const urlEl = { textContent: "" };
+    const noopBtn = () => ({ addEventListener: () => {} });
+    const lTarget = "https://pubs.rsc.org/EE/article-lookup/doi/10.1039/D6EE05315G";
+    const lArticle = "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g";
+    const topBC = { id: "bc-l" };
+    const lBrowser = {
+      browsingContext: topBC,
+      docShell: null,
+      currentURI: null,
+      contentDocument: null,
+      contentWindow: null,
+      addEventListener: () => {},
+      addProgressListener: () => {},
+      removeProgressListener: () => {},
+      fixupAndLoadURIString: () => {},
+      setAttribute: () => {},
+    };
+    const lAbort = new AbortController();
+    const lSession = {
+      url: lTarget,
+      userAgent: "Mozilla/5.0 Firefox/140.0",
+      signal: lAbort.signal,
+      onVerified: async () => ({ ok: true }),
+      resolve: () => {},
+      reject: () => {},
+    };
+    const lContext = {
+      window: {
+        location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=l1" },
+        arguments: [{ wrappedJSObject: lSession }],
+        addEventListener: () => {},
+        close: () => {},
+      },
+      document: {
+        readyState: "complete",
+        getElementById: (id) => ({
+          "si-challenge-status": statusEl,
+          "si-challenge-url": urlEl,
+          "si-challenge-reload": noopBtn(),
+          "si-challenge-extract": noopBtn(),
+          "si-challenge-cancel": noopBtn(),
+          "si-challenge-browser": lBrowser,
+        })[id] || null,
+      },
+      Services: obsServices,
+      Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+      URL,
+      Uint8Array,
+      AbortController,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      clearTimeout,
+      Date,
+    };
+    vm.createContext(lContext);
+    vm.runInContext(read("content/challenge-window.js"), lContext);
+    const respObserver = observedTopics.get("http-on-examine-response");
+    assert.ok(respObserver, "http-on-examine-response observer must be registered");
+    respObserver.observe({
+      URI: { host: "pubs.rsc.org", spec: lTarget },
+      isDocument: true,
+      loadInfo: { browsingContext: topBC },
+      responseStatus: 403,
+      getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "text/html",
+    }, "http-on-examine-response");
+    assert.ok(statusHistory.some((s) => /Cloudflare|安全验证/.test(s)), "403 cf-mitigated response must immediately update status");
+    respObserver.observe({
+      URI: { host: "pubs.rsc.org", spec: lArticle },
+      isDocument: true,
+      loadInfo: { browsingContext: topBC },
+      responseStatus: 200,
+      getResponseHeader: (h) => h.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : "",
+    }, "http-on-examine-response");
+    assert.ok(statusHistory.some((s) => /已进入出版商文章页/.test(s)), "200 HTML response must immediately update status away from loading");
+    assert.equal(urlEl.textContent, lArticle);
+    lAbort.abort();
+  }
+
+  // Scenario M: Expanded RSC SI extraction (extensionless .list__item-link datafile, deep >800-char accordion,
+  // JSON-escaped subdomain suppdata, and ignoring non-SI author guidelines links)
+  {
+    const rscArticleURL = "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g";
+    const guidelinesAnchor = {
+      textContent: "Supplementary information guidelines",
+      title: "",
+      className: "nav-link",
+      getAttribute: (name) => name === "href" ? "/journals-books-databases/author-and-reviewer-hub/author-information/prepare-and-format/supplementary-information/" : null,
+      parentElement: null,
+    };
+    const rscDatafileAnchor = {
+      textContent: "Supplementary information",
+      title: "",
+      className: "list__item-link",
+      getAttribute: (name) => name === "href" ? "/en/content/datafile/2026/ee/d6ee05315g/si1" : null,
+      parentElement: null,
+    };
+    const foundDatafile = siMod.extractSupportingLink(
+      { querySelectorAll: () => [guidelinesAnchor, rscDatafileAnchor] },
+      rscArticleURL,
+    );
+    assert.equal(
+      foundDatafile?.url,
+      "https://pubs.rsc.org/en/content/datafile/2026/ee/d6ee05315g/si1",
+      "must ignore author guidelines link and match RSC .list__item-link datafile endpoint without .pdf extension",
+    );
+
+    const deepAccordionLink = {
+      textContent: "PDF (4.8 MB)",
+      title: "",
+      className: "",
+      getAttribute: (name) => name === "href" ? "https://media.rsc.org/assets/d6ee05315g1.pdf" : null,
+      parentElement: {
+        tagName: "SPAN", id: "", className: "", textContent: "PDF (4.8 MB)", previousElementSibling: null,
+        parentElement: {
+          tagName: "DIV", id: "", className: "", textContent: "PDF (4.8 MB)", previousElementSibling: null,
+          parentElement: {
+            tagName: "LI", id: "", className: "", textContent: "PDF (4.8 MB)", previousElementSibling: null,
+            parentElement: {
+              tagName: "UL", id: "", className: "", textContent: "x".repeat(950), previousElementSibling: { tagName: "H3", className: "", textContent: "Supplementary files" },
+              parentElement: {
+                tagName: "SECTION", id: "divSupplementary", className: "accordion__panel", textContent: "x".repeat(1200),
+                querySelector: () => ({ textContent: "Supplementary files" }),
+                previousElementSibling: null,
+                parentElement: null,
+              },
+            },
+          },
+        },
+      },
+    };
+    const foundDeep = siMod.extractSupportingLink(
+      { querySelectorAll: () => [deepAccordionLink] },
+      rscArticleURL,
+    );
+    assert.equal(
+      foundDeep?.url,
+      "https://media.rsc.org/assets/d6ee05315g1.pdf",
+      "must match deeply nested SI PDF inside a large (>800-char) Supplementary files section",
+    );
+
+    const foundEscaped = siMod.extractSupportingLink(
+      { querySelectorAll: () => [] },
+      rscArticleURL,
+      '<script>window.__DATA__ = {"esiUrl":"https:\\/\\/media.rsc.org\\/suppdata\\/d6\\/ee\\/d6ee05315g\\/d6ee05315g1.pdf?download=1"};</script>',
+    );
+    assert.equal(
+      foundEscaped?.url,
+      "https://media.rsc.org/suppdata/d6/ee/d6ee05315g/d6ee05315g1.pdf?download=1",
+      "raw HTML fallback must decode JSON-escaped subdomain suppdata URLs with query strings",
+    );
+  }
 }
 
 let releaseDelay;

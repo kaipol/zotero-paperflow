@@ -111,6 +111,12 @@
     let forceExtractRequested = false;
     let secondaryResolve = null;
     let secondaryReject = null;
+    let checkInFlight = false;
+    let queuedRecheck = false;
+    let lastObservedDocURL = "";
+    let lastObservedVerifiedDocURL = "";
+    let lastObservedVerifiedAt = 0;
+    let observerRecheckTimer = null;
     const observedHosts = new Set(["challenges.cloudflare.com", "brunhild.challenges.cloudflare.com"]);
 
     function debugLog(message, error) {
@@ -281,40 +287,96 @@
         },
       };
 
+      function isTopLevelDocumentChannel(channel) {
+        try {
+          if (channel?.isDocument) return true;
+        } catch {}
+        try {
+          const loadDocFlag = typeof Components !== "undefined" && Components.interfaces?.nsIChannel?.LOAD_DOCUMENT_URI
+            ? Components.interfaces.nsIChannel.LOAD_DOCUMENT_URI
+            : 0x00010000;
+          if (Number(channel?.loadFlags || 0) & loadDocFlag) return true;
+        } catch {}
+        try {
+          const typeDoc = typeof Components !== "undefined" && Components.interfaces?.nsIContentPolicy?.TYPE_DOCUMENT
+            ? Components.interfaces.nsIContentPolicy.TYPE_DOCUMENT
+            : 6;
+          if (channel?.loadInfo?.externalContentPolicyType === typeDoc) return true;
+        } catch {}
+        return false;
+      }
+
       httpResponseObserver = {
         observe(subject, topic) {
-          if (topic !== "http-on-examine-response" || mode !== "secondary" || !secondaryResolve || settled) return;
+          if (topic !== "http-on-examine-response" || settled) return;
           try {
             const channel = typeof Components !== "undefined" && Components.interfaces?.nsIHttpChannel
               ? subject.QueryInterface(Components.interfaces.nsIHttpChannel)
               : subject;
             const host = String(channel?.URI?.host || "").toLowerCase();
-            if (!secondaryTargetHost || host !== secondaryTargetHost) return;
             const status = Number(channel?.responseStatus || 0);
-            if (status < 200 || status >= 300) return;
             let cfMitigated = "";
             let disposition = "";
             let contentType = "";
             try { cfMitigated = String(channel.getResponseHeader?.("cf-mitigated") || "").trim().toLowerCase(); } catch {}
             try { disposition = String(channel.getResponseHeader?.("content-disposition") || "").trim().toLowerCase(); } catch {}
             try { contentType = String(channel.getResponseHeader?.("content-type") || "").split(";")[0].trim().toLowerCase(); } catch {}
-            if (cfMitigated === "challenge") return;
-            const isFileDownload = /^\s*attachment\b/i.test(disposition) ||
-              (contentType && !["text/html", "application/xhtml+xml"].includes(contentType));
-            if (!isFileDownload) return;
 
-            const cancelCode = typeof Components !== "undefined" && Components.results?.NS_BINDING_ABORTED
-              ? Components.results.NS_BINDING_ABORTED
-              : 0x804b0002;
-            try { channel.cancel?.(cancelCode); } catch {}
-            const resolveSecondary = secondaryResolve;
-            secondaryResolve = null;
-            secondaryReject = null;
-            inDownloadPhase = true;
-            stopMonitoring();
-            const resolvedURL = channel?.URI?.spec || targetURL;
-            setStatus("二次安全验证已通过，正在自动下载 SI 附件…", resolvedURL);
-            resolveSecondary({ responseURL: resolvedURL, doc: null });
+            if (mode === "secondary") {
+              if (!secondaryResolve || !secondaryTargetHost || host !== secondaryTargetHost) return;
+              if (status < 200 || status >= 300) return;
+              if (cfMitigated === "challenge") return;
+              const isFileDownload = /^\s*attachment\b/i.test(disposition) ||
+                (contentType && !["text/html", "application/xhtml+xml"].includes(contentType));
+              if (!isFileDownload) return;
+
+              const cancelCode = typeof Components !== "undefined" && Components.results?.NS_BINDING_ABORTED
+                ? Components.results.NS_BINDING_ABORTED
+                : 0x804b0002;
+              try { channel.cancel?.(cancelCode); } catch {}
+              const resolveSecondary = secondaryResolve;
+              secondaryResolve = null;
+              secondaryReject = null;
+              inDownloadPhase = true;
+              stopMonitoring();
+              const resolvedURL = channel?.URI?.spec || targetURL;
+              setStatus("二次安全验证已通过，正在自动下载 SI 附件…", resolvedURL);
+              resolveSecondary({ responseURL: resolvedURL, doc: null });
+              return;
+            }
+
+            if (inDownloadPhase) return;
+            if (!host || host === "challenges.cloudflare.com" || host.endsWith(".challenges.cloudflare.com")) return;
+            const fromOurBrowser = isChannelFromChallengeBrowser(channel);
+            if (!fromOurBrowser && !matchesObservedHost(host)) return;
+            if (!isTopLevelDocumentChannel(channel)) return;
+
+            const spec = normalizeHttpURL(channel?.URI?.spec);
+            if (!spec) return;
+            lastObservedDocURL = spec;
+            trackOriginForURL(spec);
+            if (urlEl) urlEl.textContent = spec;
+
+            if (cfMitigated === "challenge" || status === 403 || status === 503) {
+              lastObservedVerifiedDocURL = "";
+              lastObservedVerifiedAt = 0;
+              setStatus("检测到 Cloudflare / 安全验证，正在等待自动跳过；如出现验证框请手动点击完成…", spec);
+              return;
+            }
+
+            const isHTMLResponse = !contentType || contentType === "text/html" || contentType === "application/xhtml+xml";
+            if (status >= 200 && status < 300 && isHTMLResponse && !isDOIRedirectHost(spec)) {
+              lastObservedVerifiedDocURL = spec;
+              lastObservedVerifiedAt = Date.now();
+              if (!isLoginOrAuthDoc(null, spec)) {
+                setStatus("已进入出版商文章页，正在检测 SI 链接…", spec);
+              }
+              if (observerRecheckTimer) clearTimeout(observerRecheckTimer);
+              observerRecheckTimer = setTimeout(() => {
+                observerRecheckTimer = null;
+                void checkPageState();
+              }, 260);
+            }
           } catch {
             // Ignore inspection errors on non-HTTP channels.
           }
@@ -521,6 +583,10 @@
 
     function currentLocation() {
       try {
+        const fromWindowGlobal = normalizeHttpURL(browser?.browsingContext?.currentWindowGlobal?.documentURI?.spec);
+        if (fromWindowGlobal) return fromWindowGlobal;
+      } catch {}
+      try {
         const fromURI = normalizeHttpURL(browser?.currentURI?.spec);
         if (fromURI) return fromURI;
       } catch {}
@@ -538,10 +604,10 @@
         if (fromDoc) return fromDoc;
       } catch {}
       try {
-        return normalizeHttpURL(browser?.contentWindow?.location?.href);
-      } catch {
-        return "";
-      }
+        const fromContentWin = normalizeHttpURL(browser?.contentWindow?.location?.href);
+        if (fromContentWin) return fromContentWin;
+      } catch {}
+      return normalizeHttpURL(lastObservedVerifiedDocURL || lastObservedDocURL);
     }
 
     function isDOIRedirectHost(url) {
@@ -553,16 +619,18 @@
       }
     }
 
-    function hasMeaningfulBody(doc) {
+    function hasMeaningfulBody(doc, rawHTML = "") {
       try {
         const body = doc?.body;
-        if (!body) return false;
-        const children = body.children?.length || 0;
-        const textLen = String(body.textContent || "").trim().length;
-        return children > 0 || textLen > 40;
+        if (body) {
+          const children = body.children?.length || 0;
+          const textLen = String(body.textContent || "").trim().length;
+          if (children > 0 || textLen > 40) return true;
+        }
       } catch {
-        return false;
+        // Fall through to HTML length check.
       }
+      return String(rawHTML || "").trim().length > 200;
     }
 
     function stopMonitoring() {
@@ -570,6 +638,10 @@
       if (readyRetryTimer) {
         clearTimeout(readyRetryTimer);
         readyRetryTimer = null;
+      }
+      if (observerRecheckTimer) {
+        clearTimeout(observerRecheckTimer);
+        observerRecheckTimer = null;
       }
       if (pollTimer) {
         clearInterval(pollTimer);
@@ -769,37 +841,157 @@
       }
     }
 
-    function checkPageState() {
-      if (settled || inDownloadPhase) return;
+    function sendActorQuery(actor, name, timeoutMs) {
+      return new Promise((resolve, reject) => {
+        let timer = null;
+        let done = false;
+        const finish = (fn, value) => {
+          if (done) return;
+          done = true;
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          fn(value);
+        };
+        timer = setTimeout(() => finish(reject, new Error(`PageData ${name} query timed out`)), timeoutMs);
+        try {
+          Promise.resolve(actor.sendQuery(name))
+            .then((value) => finish(resolve, value))
+            .catch((error) => finish(reject, error));
+        } catch (error) {
+          finish(reject, error);
+        }
+      });
+    }
+
+    async function queryPageDataActor(timeoutMs = 2200) {
+      let actor = null;
       try {
+        actor = browser?.browsingContext?.currentWindowGlobal?.getActor?.("PageData") || null;
+      } catch (error) {
+        debugLog("Could not obtain PageData window actor", error);
+        return null;
+      }
+      if (!actor || typeof actor.sendQuery !== "function") return null;
+      try {
+        const [titleResult, htmlResult] = await Promise.allSettled([
+          sendActorQuery(actor, "title", timeoutMs),
+          sendActorQuery(actor, "documentHTML", timeoutMs),
+        ]);
+        const title = titleResult.status === "fulfilled" ? String(titleResult.value || "") : "";
+        const html = htmlResult.status === "fulfilled" ? String(htmlResult.value || "") : "";
+        if (!html && !title) return null;
+        let parsedDoc = null;
+        if (html && typeof DOMParser === "function") {
+          try {
+            parsedDoc = new DOMParser().parseFromString(html, "text/html");
+          } catch {
+            parsedDoc = null;
+          }
+        }
+        return {
+          doc: parsedDoc,
+          html,
+          title: title || String(parsedDoc?.title || ""),
+          readyState: "complete",
+          source: "pagedata-actor",
+        };
+      } catch (error) {
+        debugLog("PageData actor snapshot failed", error);
+        return null;
+      }
+    }
+
+    async function readPageSnapshot(timeoutMs = 2200) {
+      const liveDoc = getContentDocument();
+      if (liveDoc && liveDoc.documentElement) {
+        const html = readDocumentHTML(liveDoc);
+        let readyState = "";
+        let title = "";
+        try { readyState = String(liveDoc.readyState || ""); } catch {}
+        try { title = String(liveDoc.title || ""); } catch {}
+        if (html || readyState || title) {
+          return {
+            doc: liveDoc,
+            html,
+            title,
+            readyState,
+            source: "content-document",
+          };
+        }
+      }
+      const actorSnapshot = await queryPageDataActor(timeoutMs);
+      if (actorSnapshot) return actorSnapshot;
+      return {
+        doc: liveDoc && liveDoc.documentElement ? liveDoc : null,
+        html: "",
+        title: "",
+        readyState: "",
+        source: "none",
+      };
+    }
+
+    function dispatchVerified({ doc, responseURL, html, source }) {
+      inDownloadPhase = true;
+      stopMonitoring();
+      const handle = createSessionHandle();
+      if (typeof session?.onVerified === "function") {
+        Promise.resolve(session.onVerified({ doc: doc || null, responseURL, html: String(html || ""), source: source || "", handle }))
+          .then((result) => succeedSession(result))
+          .catch((error) => failSession(error));
+      } else {
+        succeedSession({ doc: doc || null, responseURL, html: String(html || ""), source: source || "", handle });
+      }
+    }
+
+    async function checkPageState() {
+      if (settled || inDownloadPhase) return;
+      if (checkInFlight) {
+        queuedRecheck = true;
+        return;
+      }
+      checkInFlight = true;
+      try {
+        const snapshot = await readPageSnapshot(forceExtractRequested ? 5000 : 2200);
+        if (settled || inDownloadPhase) return;
         const currentURL = currentLocation();
-        const doc = getContentDocument();
-        if (forceExtractRequested && (!currentURL || !doc || !doc.documentElement)) {
-          const fallbackURL = currentURL || targetURL;
+        const doc = snapshot.doc;
+        const html = snapshot.html;
+
+        if (forceExtractRequested && (!currentURL || (!doc && !html))) {
+          const fallbackURL = currentURL || lastObservedVerifiedDocURL || lastObservedDocURL || targetURL;
           if (!fallbackURL || !/^https?:\/\//i.test(fallbackURL)) {
             forceExtractRequested = false;
             setStatus("页面尚未就绪，请等待页面加载完成或点击「刷新」重试。");
             return;
           }
-          inDownloadPhase = true;
-          stopMonitoring();
           setStatus("正在使用当前已验证会话提取 Supporting Information…", fallbackURL);
-          const html = doc ? readDocumentHTML(doc) : "";
-          const handle = createSessionHandle();
-          if (typeof session?.onVerified === "function") {
-            Promise.resolve(session.onVerified({ doc: doc || null, responseURL: fallbackURL, html, handle }))
-              .then((result) => succeedSession(result))
-              .catch((error) => failSession(error));
-          } else {
-            succeedSession({ doc: doc || null, responseURL: fallbackURL, html, handle });
-          }
+          dispatchVerified({ doc: null, responseURL: fallbackURL, html: "", source: "http-fallback" });
           return;
         }
 
         if (!currentURL || !/^https?:\/\//i.test(currentURL)) return;
         trackOriginForURL(currentURL);
         if (urlEl) urlEl.textContent = currentURL;
-        if (!doc || !doc.documentElement) return;
+
+        if (!doc && !html) {
+          if (isDOIRedirectHost(currentURL)) {
+            setStatus("正在解析 DOI 并跳转至出版商页面…", currentURL);
+            return;
+          }
+          if (lastObservedVerifiedDocURL && !isLoginOrAuthDoc(null, lastObservedVerifiedDocURL)) {
+            const observedElapsed = Date.now() - lastObservedVerifiedAt;
+            if (observedElapsed < HYDRATION_SETTLE_MS) {
+              setStatus("验证已通过，正在等待文章页加载完成…", lastObservedVerifiedDocURL);
+              return;
+            }
+            setStatus("验证已通过，正在自动提取 Supporting Information…", lastObservedVerifiedDocURL);
+            dispatchVerified({ doc: null, responseURL: lastObservedVerifiedDocURL, html: "", source: "http-observer-fallback" });
+          }
+          return;
+        }
+
         if (isDOIRedirectHost(currentURL) && !forceExtractRequested) {
           setStatus("正在解析 DOI 并跳转至出版商页面…", currentURL);
           return;
@@ -807,25 +999,33 @@
 
         let hasLink = false;
         try {
-          if (typeof session?.hasSupportingLink === "function") {
+          if (doc && typeof session?.hasSupportingLink === "function") {
             hasLink = Boolean(session.hasSupportingLink(doc, currentURL));
           }
         } catch (error) {
-          debugLog("hasSupportingLink threw on contentDocument; will fall back to HTML check", error);
+          debugLog("hasSupportingLink threw on document; will fall back to HTML check", error);
+        }
+        if (!hasLink && html && typeof session?.hasSupportingLinkHTML === "function") {
           try {
-            const htmlPreview = readDocumentHTML(doc);
-            if (htmlPreview && typeof session?.hasSupportingLinkHTML === "function") {
-              hasLink = Boolean(session.hasSupportingLinkHTML(htmlPreview, currentURL));
-            }
+            hasLink = Boolean(session.hasSupportingLinkHTML(html, currentURL));
           } catch {}
         }
 
         let challengeDetected = false;
         try {
-          challengeDetected = isChallengeDoc(doc, currentURL);
+          if (doc) {
+            challengeDetected = isChallengeDoc(doc, currentURL);
+          } else {
+            const titleText = String(snapshot.title || "");
+            const htmlPrefix = String(html || "").slice(0, 16384);
+            challengeDetected =
+              /just a moment|attention required|checking your browser|one more step|verify you are human|security check|ddos-guard|请稍候|正在检查|安全验证/i.test(titleText) ||
+              /Enable JavaScript and cookies to continue|Checking if the site connection is secure/i.test(htmlPrefix) ||
+              (/\/cdn-cgi\/challenge-platform\//i.test(htmlPrefix) && /(?:\b_cf_chl_opt\b|challenge-error-text|cf-browser-verification|managed_checking_msg)/i.test(htmlPrefix));
+          }
         } catch (error) {
           debugLog("isChallengeDoc threw; using title fallback", error);
-          challengeDetected = /just a moment|attention required|checking your browser|security check|请稍候/i.test(String(doc?.title || ""));
+          challengeDetected = /just a moment|attention required|checking your browser|security check|请稍候/i.test(String(snapshot.title || doc?.title || ""));
         }
 
         if (challengeDetected && !forceExtractRequested) {
@@ -835,8 +1035,9 @@
           return;
         }
 
-        const ready = doc.readyState === "interactive" || doc.readyState === "complete";
-        if (!forceExtractRequested && (!ready || !hasMeaningfulBody(doc))) return;
+        const readyState = snapshot.readyState || String(doc?.readyState || "");
+        const ready = snapshot.source === "pagedata-actor" || readyState === "interactive" || readyState === "complete";
+        if (!forceExtractRequested && (!ready || !hasMeaningfulBody(doc, html))) return;
 
         if (mode === "secondary") {
           if (secondaryResolve) {
@@ -863,28 +1064,24 @@
         }
 
         const elapsed = Date.now() - pageVerifiedAt;
-        if (!hasLink && !forceExtractRequested && (doc.readyState !== "complete" || elapsed < HYDRATION_SETTLE_MS)) {
+        if (!hasLink && !forceExtractRequested && ((readyState && readyState !== "complete") || elapsed < HYDRATION_SETTLE_MS)) {
           setStatus("验证已通过，正在等待文章页及 SI 链接加载完成…", currentURL);
           return;
         }
 
-        inDownloadPhase = true;
-        stopMonitoring();
         setStatus("验证已通过，正在自动识别并下载 Supporting Information…", currentURL);
-        const html = readDocumentHTML(doc);
-        const handle = createSessionHandle();
-        if (typeof session?.onVerified === "function") {
-          Promise.resolve(session.onVerified({ doc, responseURL: currentURL, html, handle }))
-            .then((result) => succeedSession(result))
-            .catch((error) => failSession(error));
-        } else {
-          succeedSession({ doc, responseURL: currentURL, html, handle });
-        }
+        dispatchVerified({ doc, responseURL: currentURL, html: html || readDocumentHTML(doc), source: snapshot.source });
       } catch (error) {
         debugLog("Unexpected error in checkPageState", error);
         if (forceExtractRequested) {
           forceExtractRequested = false;
           setStatus(`提取触发异常：${String(error?.message || error)}`);
+        }
+      } finally {
+        checkInFlight = false;
+        if (queuedRecheck && !settled && !inDownloadPhase) {
+          queuedRecheck = false;
+          void checkPageState();
         }
       }
     }
@@ -925,14 +1122,15 @@
               : 0x00000010;
             if (stateFlags & stopFlag) checkPageState();
           },
-          onLocationChange(_webProgress, _request, location) {
+          onLocationChange(webProgress, _request, location) {
             const nextURL = normalizeHttpURL(location?.spec);
-            if (nextURL) {
+            if (nextURL && webProgress?.isTopLevel !== false) {
               clearNavRetry();
+              lastObservedDocURL = nextURL;
               trackOriginForURL(nextURL);
               if (urlEl) urlEl.textContent = nextURL;
             }
-            checkPageState();
+            void checkPageState();
           },
           onProgressChange() {},
           onStatusChange() {},
@@ -952,6 +1150,8 @@
         if (inDownloadPhase) return;
         pageVerifiedAt = 0;
         lastVerifiedURL = "";
+        lastObservedVerifiedDocURL = "";
+        lastObservedVerifiedAt = 0;
         forceExtractRequested = false;
         const activeURL = currentLocation();
         if (activeURL && typeof browser?.reload === "function") {

@@ -1,6 +1,6 @@
 {
   "name": "zotero-paperflow",
-  "version": "0.3.17",
+  "version": "0.3.18",
   "private": true,
   "description": "Zotero 10 bootstrap XPI plugin for Supporting Information import and Chinese full-text translation PDFs.",
   "scripts": {

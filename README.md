@@ -28,6 +28,8 @@
 
 **0.3.17 过检自动提取、手动按钮响应与 RSC SI 链接识别修复：**修复质询窗口轮询因跨沙箱 DOM 迭代异常或页头隐藏登录表单误判导致通过验证后无法自动提取、点击「已通过，立即提取 SI」无反应且提示框停留在加载页的问题（增加多途径文档读取、异常隔离、同域 HTML 重新解析、手动按钮强制触发与无 DOM 会话回退）；同时增强 RSC 等出版商 SI 链接识别（支持 `Supplementary files` 区块上下文链接、`data-href/data-url`、HTML 源码直链兜底以及 `pubs.rsc.org` `articlehtml` 自动回退 `articlelanding`）。
 
+**0.3.18 Zotero 10 PageData 跨进程页面采集与 RSC 深度链接提取：**修复 Zotero 10 质询窗口在 Cloudflare COOP 隔离或远程内容进程下 `browser.contentDocument` 为空导致状态栏一直停留在「正在加载出版商页面…」且无法自动提取 SI 的问题（接入 Zotero 内置 `PageData` JSWindowActor 与 `browsingContext.currentWindowGlobal.documentURI` 读取实时渲染后的页面 HTML，并在 `http-on-examine-response` 中同步跟踪主文档 403/200 状态）；同时扩展 RSC 等出版商的 SI 识别（兼容 `.list__item-link` 无扩展名 `datafile`/`getsupplementary` 链接、7 层深嵌套区块上下文、全子域 JSON 转义 `suppdata` 源码兜底、meta-refresh 跳转跟踪、`articlepdf/articlehtml` 回退 `articlelanding` 以及 `si-error.txt` 脱敏页面诊断信息）。
+
 ## 功能与实现结构
 
 ```text

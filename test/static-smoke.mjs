@@ -28,7 +28,7 @@ assert.match(chromeManifest, /^content zotero-auto-fulltext content\/\s*$/);
 assert.doesNotMatch(chromeManifest, /\.\/content\//);
 
 const manifest = JSON.parse(read("manifest.json"));
-assert.equal(manifest.version, "0.3.17");
+assert.equal(manifest.version, "0.3.18");
 assert.equal(manifest.name, "Zotero PaperFlow");
 assert.equal(manifest.applications.zotero.strict_min_version, "10.0.8");
 assert.equal(manifest.applications.zotero.strict_max_version, "10.*");
@@ -98,6 +98,10 @@ assert.match(challengeWindowScript, /navigateForSecondaryChallenge/);
 assert.match(challengeWindowScript, /credentials:\s*"include"/);
 assert.match(challengeWindowScript, /getContentDocument/);
 assert.match(challengeWindowScript, /readDocumentHTML/);
+assert.match(challengeWindowScript, /queryPageDataActor/);
+assert.match(challengeWindowScript, /getActor\?\.\("PageData"\)/);
+assert.match(challengeWindowScript, /documentURI\?\.spec/);
+assert.match(challengeWindowScript, /isTopLevelDocumentChannel/);
 assert.match(challengeWindowScript, /SupportingInfoChallengeCancelledError/);
 
 const supportingInfo = read("content/modules/supporting-info.js");
@@ -109,6 +113,8 @@ assert.match(supportingInfo, /function combineSignals\(/);
 assert.match(supportingInfo, /isBareDOISupplLanding/);
 assert.match(supportingInfo, /function extractSupportingLink\(doc, responseURL/);
 assert.match(supportingInfo, /function extractSupportingLinkFromHTML\(/);
+assert.match(supportingInfo, /function extractMetaRefreshURL\(/);
+assert.match(supportingInfo, /function isNonSIUtilityLink\(/);
 assert.match(supportingInfo, /function rscLandingFallbackURL\(/);
 assert.match(supportingInfo, /function getBrowserUserAgent\(\)/);
 assert.match(supportingInfo, /function responseFilename\(/);
