@@ -244,7 +244,7 @@ var AutoFullTextMain = (function () {
       cancelLabel: "取消翻译",
       cancellingStage: "正在取消全文翻译并清理中间文件…",
       accentColor: "#0f766e",
-      showChallengeFocus: false,
+      showChallengeFocus: true,
       totalCount,
       onCancel,
     });
@@ -390,6 +390,7 @@ var AutoFullTextMain = (function () {
         const translationRunInfo = {
           controller,
           stage: "正在读取并解析文章网页…",
+          focusChallenge: null,
         };
         activeTranslationRuns.set(itemID, translationRunInfo);
         try {
@@ -400,8 +401,12 @@ var AutoFullTextMain = (function () {
             }
           } else {
             await AutoFullTextTranslation.create(item, signal, {
-              onProgress: ({ stage, percent }) => {
+              onProgress: ({ stage, percent, challengeWindow }) => {
                 if (stage) translationRunInfo.stage = stage;
+                if (challengeWindow !== undefined) {
+                  translationRunInfo.focusChallenge = challengeWindow ? () => challengeWindow.focus?.() : null;
+                  ownTranslationPanel?.setChallengeWindow?.(challengeWindow);
+                }
                 ownTranslationPanel?.update?.(stage, percent);
               },
             });
@@ -417,16 +422,24 @@ var AutoFullTextMain = (function () {
             }
             return cancelledResult();
           }
-          failed += 1;
-          translationFailed = true;
-          const detail = String(error?.message || error);
-          errors.push(`全文翻译：${detail}`);
-          AutoFullText.log(`Full-text translation stopped for ${item.key}`, error);
-          if (!externalTranslationPanel && ownTranslationPanel) {
-            ownTranslationPanel.finish("全文翻译已停止。", { isError: true, delayMs: 3600 });
-          }
-          if (!requestedActions) {
-            Zotero.getMainWindow()?.alert(`文献 ${item.key} 的全文翻译已停止。\n${detail}`);
+          if (error?.name === "FullTextChallengeCancelledError") {
+            if (!externalTranslationPanel && ownTranslationPanel) {
+              ownTranslationPanel.finish("已取消安全验证，全文翻译已停止。", { isError: true, delayMs: 2200 });
+            }
+            if (requestedActions) return cancelledResult();
+            skipped += 1;
+          } else {
+            failed += 1;
+            translationFailed = true;
+            const detail = String(error?.message || error);
+            errors.push(`全文翻译：${detail}`);
+            AutoFullText.log(`Full-text translation stopped for ${item.key}`, error);
+            if (!externalTranslationPanel && ownTranslationPanel) {
+              ownTranslationPanel.finish("全文翻译已停止。", { isError: true, delayMs: 3600 });
+            }
+            if (!requestedActions) {
+              Zotero.getMainWindow()?.alert(`文献 ${item.key} 的全文翻译已停止。\n${detail}`);
+            }
           }
         } finally {
           releaseAction("fullTextTranslation");
@@ -808,6 +821,10 @@ var AutoFullTextMain = (function () {
       (isTranslationAction && items.every((item) => activeActions.get(item.id)?.has("fullTextTranslation")));
     if (isSIAction && allAlreadyRunning) {
       const runningInfo = activeSIRuns.get(items[0].id);
+      try { runningInfo?.focusChallenge?.(); } catch {}
+    }
+    if (isTranslationAction && allAlreadyRunning) {
+      const runningInfo = activeTranslationRuns.get(items[0].id);
       try { runningInfo?.focusChallenge?.(); } catch {}
     }
 

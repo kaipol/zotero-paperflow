@@ -106,6 +106,7 @@
     let lastVerifiedURL = "";
     let inDownloadPhase = false;
     let mode = session?.mode || "article";
+    const isTranslationMode = mode === "translation";
     let targetURL = session?.url || "";
     let secondaryTargetHost = "";
     let forceExtractRequested = false;
@@ -118,6 +119,46 @@
     let lastObservedVerifiedAt = 0;
     let observerRecheckTimer = null;
     const observedHosts = new Set(["challenges.cloudflare.com", "brunhild.challenges.cloudflare.com"]);
+
+    const copy = isTranslationMode
+      ? {
+        enteredPage: "已进入出版商文章页，正在等待文章正文加载完成…",
+        loginRequired: "检测到机构或账号登录页面，请完成登录，回到文章页后将自动提取正文…",
+        waitingHydration: "验证已通过，正在等待文章正文加载完成…",
+        autoExtract: "验证已通过，正在提取文章正文并准备清洗翻译…",
+        manualExtract: "正在提取当前页面的文章正文…",
+        manualFallback: "正在使用当前已验证会话提取文章正文…",
+        inProgress: "正在提取文章正文与图片资源，请稍候…",
+        cancelErrorName: session?.cancelErrorName || "FullTextChallengeCancelledError",
+        cancelMessage: session?.cancelErrorMessage || "已取消安全验证，全文翻译已停止。",
+        closeMessage: "安全验证窗口已关闭，全文翻译已停止。",
+        accessErrorName: session?.accessErrorName || "FullTextAccessError",
+        abortMessage: "Full-text translation verification cancelled.",
+      }
+      : {
+        enteredPage: "已进入出版商文章页，正在检测 SI 链接…",
+        loginRequired: "检测到机构或账号登录页面，请完成登录，回到文章页后将自动提取 SI…",
+        waitingHydration: "验证已通过，正在等待文章页及 SI 链接加载完成…",
+        autoExtract: "验证已通过，正在自动识别并下载 Supporting Information…",
+        manualExtract: "正在提取当前页面的 SI 链接…",
+        manualFallback: "正在使用当前已验证会话提取 Supporting Information…",
+        inProgress: "正在提取并下载 SI，请稍候…",
+        cancelErrorName: session?.cancelErrorName || "SupportingInfoChallengeCancelledError",
+        cancelMessage: session?.cancelErrorMessage || "已取消安全验证，SI 尚未导入。",
+        closeMessage: "安全验证窗口已关闭，SI 尚未导入。",
+        accessErrorName: session?.accessErrorName || "SupportingInfoAccessError",
+        abortMessage: "Supporting information verification cancelled.",
+      };
+
+    if (session?.windowTitle) {
+      try { document.title = String(session.windowTitle); } catch {}
+    } else if (isTranslationMode) {
+      try { document.title = "Zotero PaperFlow — 全文翻译安全验证"; } catch {}
+    }
+    if (extractBtn) {
+      if (session?.extractLabel) extractBtn.textContent = String(session.extractLabel);
+      else if (isTranslationMode) extractBtn.textContent = "已通过，立即提取正文";
+    }
 
     function debugLog(message, error) {
       try {
@@ -369,7 +410,7 @@
               lastObservedVerifiedDocURL = spec;
               lastObservedVerifiedAt = Date.now();
               if (!isLoginOrAuthDoc(null, spec)) {
-                setStatus("已进入出版商文章页，正在检测 SI 链接…", spec);
+                setStatus(copy.enteredPage, spec);
               }
               if (observerRecheckTimer) clearTimeout(observerRecheckTimer);
               observerRecheckTimer = setTimeout(() => {
@@ -701,12 +742,12 @@
     }
 
     function onAbort() {
-      const error = new Error("Supporting information verification cancelled.");
+      const error = new Error(copy.abortMessage);
       error.name = "AbortError";
       failSession(error);
     }
 
-    async function fetchInWindow(fileURL, referrerURL, maxBytes) {
+    async function fetchInWindow(fileURL, referrerURL, maxBytes, acceptHeader = "") {
       const contentWin = browser?.contentWindow;
       if (!contentWin || typeof contentWin.fetch !== "function") {
         throw Object.assign(new Error("Challenge window fetch API is unavailable."), { name: "ChallengeFetchUnavailable" });
@@ -715,7 +756,7 @@
       if (currentURL) {
         try {
           if (new URL(fileURL).origin !== new URL(currentURL).origin) {
-            throw Object.assign(new Error("Cross-origin SI URL uses session HTTP download."), { name: "ChallengeFetchCrossOrigin" });
+            throw Object.assign(new Error("Cross-origin URL uses session HTTP download."), { name: "ChallengeFetchCrossOrigin" });
           }
         } catch (error) {
           if (error?.name === "ChallengeFetchCrossOrigin") throw error;
@@ -730,6 +771,9 @@
       windowAbortController?.signal?.addEventListener("abort", abort, { once: true });
       if (session?.signal?.aborted || windowAbortController?.signal?.aborted) abort();
       let oversized = false;
+      const oversizeMessage = maxBytes >= 100 * 1024 * 1024
+        ? "Supporting file exceeds the 100 MB download limit."
+        : `Downloaded resource exceeds the ${maxBytes}-byte limit.`;
       try {
         const response = await contentWin.fetch(fileURL, {
           method: "GET",
@@ -738,7 +782,7 @@
           cache: "no-store",
           referrer: referrerURL || undefined,
           headers: {
-            Accept: "application/pdf,application/octet-stream,*/*;q=0.5",
+            Accept: acceptHeader || "application/pdf,application/octet-stream,*/*;q=0.5",
           },
           signal: controller?.signal,
         });
@@ -749,7 +793,7 @@
         if (contentLength > maxBytes) {
           oversized = true;
           abort();
-          throw new Error("Supporting file exceeds the 100 MB download limit.");
+          throw new Error(oversizeMessage);
         }
 
         let bytes;
@@ -767,7 +811,7 @@
               oversized = true;
               try { await reader.cancel(); } catch {}
               abort();
-              throw new Error("Supporting file exceeds the 100 MB download limit.");
+              throw new Error(oversizeMessage);
             }
             chunks.push(chunk);
           }
@@ -781,7 +825,7 @@
           const buffer = await response.arrayBuffer();
           if (buffer.byteLength > maxBytes) {
             oversized = true;
-            throw new Error("Supporting file exceeds the 100 MB download limit.");
+            throw new Error(oversizeMessage);
           }
           bytes = new Uint8Array(buffer);
         }
@@ -796,7 +840,7 @@
           },
         };
       } catch (error) {
-        if (oversized) throw new Error("Supporting file exceeds the 100 MB download limit.");
+        if (oversized) throw new Error(oversizeMessage);
         throw error;
       } finally {
         session?.signal?.removeEventListener("abort", abort);
@@ -966,7 +1010,7 @@
             setStatus("页面尚未就绪，请等待页面加载完成或点击「刷新」重试。");
             return;
           }
-          setStatus("正在使用当前已验证会话提取 Supporting Information…", fallbackURL);
+          setStatus(copy.manualFallback, fallbackURL);
           dispatchVerified({ doc: null, responseURL: fallbackURL, html: "", source: "http-fallback" });
           return;
         }
@@ -983,10 +1027,10 @@
           if (lastObservedVerifiedDocURL && !isLoginOrAuthDoc(null, lastObservedVerifiedDocURL)) {
             const observedElapsed = Date.now() - lastObservedVerifiedAt;
             if (observedElapsed < HYDRATION_SETTLE_MS) {
-              setStatus("验证已通过，正在等待文章页加载完成…", lastObservedVerifiedDocURL);
+              setStatus(copy.waitingHydration, lastObservedVerifiedDocURL);
               return;
             }
-            setStatus("验证已通过，正在自动提取 Supporting Information…", lastObservedVerifiedDocURL);
+            setStatus(copy.autoExtract, lastObservedVerifiedDocURL);
             dispatchVerified({ doc: null, responseURL: lastObservedVerifiedDocURL, html: "", source: "http-observer-fallback" });
           }
           return;
@@ -997,18 +1041,33 @@
           return;
         }
 
-        let hasLink = false;
-        try {
-          if (doc && typeof session?.hasSupportingLink === "function") {
-            hasLink = Boolean(session.hasSupportingLink(doc, currentURL));
-          }
-        } catch (error) {
-          debugLog("hasSupportingLink threw on document; will fall back to HTML check", error);
-        }
-        if (!hasLink && html && typeof session?.hasSupportingLinkHTML === "function") {
+        let hasExpectedContent = false;
+        if (isTranslationMode) {
           try {
-            hasLink = Boolean(session.hasSupportingLinkHTML(html, currentURL));
-          } catch {}
+            if (doc && typeof session?.hasArticleContent === "function") {
+              hasExpectedContent = Boolean(session.hasArticleContent(doc, currentURL));
+            }
+          } catch (error) {
+            debugLog("hasArticleContent threw on document; will fall back to HTML check", error);
+          }
+          if (!hasExpectedContent && html && typeof session?.hasArticleContentHTML === "function") {
+            try {
+              hasExpectedContent = Boolean(session.hasArticleContentHTML(html, currentURL));
+            } catch {}
+          }
+        } else {
+          try {
+            if (doc && typeof session?.hasSupportingLink === "function") {
+              hasExpectedContent = Boolean(session.hasSupportingLink(doc, currentURL));
+            }
+          } catch (error) {
+            debugLog("hasSupportingLink threw on document; will fall back to HTML check", error);
+          }
+          if (!hasExpectedContent && html && typeof session?.hasSupportingLinkHTML === "function") {
+            try {
+              hasExpectedContent = Boolean(session.hasSupportingLinkHTML(html, currentURL));
+            } catch {}
+          }
         }
 
         let challengeDetected = false;
@@ -1052,9 +1111,9 @@
           return;
         }
 
-        if (!hasLink && !forceExtractRequested && isLoginOrAuthDoc(doc, currentURL)) {
+        if (!hasExpectedContent && !forceExtractRequested && isLoginOrAuthDoc(doc, currentURL)) {
           pageVerifiedAt = 0;
-          setStatus("检测到机构或账号登录页面，请完成登录，回到文章页后将自动提取 SI…", currentURL);
+          setStatus(copy.loginRequired, currentURL);
           return;
         }
 
@@ -1064,12 +1123,16 @@
         }
 
         const elapsed = Date.now() - pageVerifiedAt;
-        if (!hasLink && !forceExtractRequested && ((readyState && readyState !== "complete") || elapsed < HYDRATION_SETTLE_MS)) {
-          setStatus("验证已通过，正在等待文章页及 SI 链接加载完成…", currentURL);
+        const waitingForFullDocument = isTranslationMode
+          ? (readyState && readyState !== "complete" && elapsed < HYDRATION_SETTLE_MS) ||
+            (!hasExpectedContent && elapsed < HYDRATION_SETTLE_MS)
+          : (!hasExpectedContent && ((readyState && readyState !== "complete") || elapsed < HYDRATION_SETTLE_MS));
+        if (!forceExtractRequested && waitingForFullDocument) {
+          setStatus(copy.waitingHydration, currentURL);
           return;
         }
 
-        setStatus("验证已通过，正在自动识别并下载 Supporting Information…", currentURL);
+        setStatus(copy.autoExtract, currentURL);
         dispatchVerified({ doc, responseURL: currentURL, html: html || readDocumentHTML(doc), source: snapshot.source });
       } catch (error) {
         debugLog("Unexpected error in checkPageState", error);
@@ -1098,7 +1161,7 @@
           return;
         }
         failSession(Object.assign(new Error("等待出版商安全验证超时。"), {
-          name: "SupportingInfoAccessError",
+          name: copy.accessErrorName,
           publisherURL: targetURL,
         }));
       }, session?.timeoutMs || MAX_POLL_MS);
@@ -1168,19 +1231,19 @@
       extractBtn.addEventListener("click", () => {
         if (settled) return;
         if (inDownloadPhase) {
-          setStatus("正在提取并下载 SI，请稍候…", currentLocation() || targetURL);
+          setStatus(copy.inProgress, currentLocation() || targetURL);
           return;
         }
         forceExtractRequested = true;
-        setStatus("正在提取当前页面的 SI 链接…", currentLocation() || targetURL);
+        setStatus(copy.manualExtract, currentLocation() || targetURL);
         checkPageState();
       });
     }
 
     if (cancelBtn) {
       cancelBtn.addEventListener("click", () => {
-        const error = Object.assign(new Error("已取消安全验证，SI 尚未导入。"), {
-          name: "SupportingInfoChallengeCancelledError",
+        const error = Object.assign(new Error(copy.cancelMessage), {
+          name: copy.cancelErrorName,
           publisherURL: targetURL,
         });
         windowAbortController?.abort();
@@ -1199,8 +1262,8 @@
         cleanup();
         return;
       }
-      const error = Object.assign(new Error("安全验证窗口已关闭，SI 尚未导入。"), {
-        name: "SupportingInfoChallengeCancelledError",
+      const error = Object.assign(new Error(copy.closeMessage), {
+        name: copy.cancelErrorName,
         publisherURL: targetURL,
       });
       windowAbortController?.abort();

@@ -11,7 +11,77 @@ var AutoFullTextTranslation = (function () {
   const maxTranslationSegments = 5000;
 
   function textLength(element) {
-    return (element.textContent || "").trim().length;
+    return (element?.textContent || "").trim().length;
+  }
+
+  function isChallengeHTML(html) {
+    if (typeof AutoFullTextSupportingInfo !== "undefined" && typeof AutoFullTextSupportingInfo?.isChallengeHTML === "function") {
+      return Boolean(AutoFullTextSupportingInfo.isChallengeHTML(html));
+    }
+    const text = String(html || "").slice(0, 65536);
+    if (!text) return false;
+    return /just a moment|attention required|checking your browser|one more step|verify you are human|security check|ddos-guard|请稍候|正在检查|安全验证/i.test(text) ||
+      /Enable JavaScript and cookies to continue|Checking if the site connection is secure/i.test(text) ||
+      (/\/cdn-cgi\/challenge-platform\//i.test(text) && /(?:\b_cf_chl_opt\b|challenge-error-text|cf-browser-verification|managed_checking_msg)/i.test(text));
+  }
+
+  function isChallengeDocument(doc, currentURL) {
+    if (typeof AutoFullTextSupportingInfo !== "undefined" && typeof AutoFullTextSupportingInfo?.isChallengeDocument === "function") {
+      return Boolean(AutoFullTextSupportingInfo.isChallengeDocument(doc, currentURL));
+    }
+    if (!doc || !doc.documentElement) return true;
+    return isChallengeHTML(String(doc.documentElement.outerHTML || ""));
+  }
+
+  function extractResponseInfo(responseOrError) {
+    if (!responseOrError) return { status: 0, cfMitigated: "", server: "", bodyPrefix: "" };
+    const xhr = responseOrError.xmlhttp || responseOrError;
+    const status = Number(responseOrError.status ?? xhr?.status ?? 0) || 0;
+    const getHeader = (name) => {
+      try {
+        if (typeof xhr?.getResponseHeader === "function") return String(xhr.getResponseHeader(name) || "");
+      } catch {}
+      try {
+        if (typeof responseOrError.getResponseHeader === "function") return String(responseOrError.getResponseHeader(name) || "");
+      } catch {}
+      return "";
+    };
+    let bodyPrefix = "";
+    try {
+      const raw = responseOrError.responseText ?? xhr?.responseText ?? xhr?.response ?? "";
+      if (typeof raw === "string") bodyPrefix = raw.slice(0, 16384);
+    } catch {}
+    return {
+      status,
+      cfMitigated: getHeader("cf-mitigated").trim().toLowerCase(),
+      server: getHeader("server").trim().toLowerCase(),
+      bodyPrefix,
+    };
+  }
+
+  function isChallengeHTTP(error, info = null) {
+    const resolved = info || extractResponseInfo(error);
+    const status = resolved.status || Number(String(error?.message || "").match(/\bHTTP(?: resource returned)? status (\d{3})\b/i)?.[1] || 0);
+    if (resolved.cfMitigated === "challenge") return true;
+    if (status === 403) return true;
+    if (status === 503 && (resolved.server.includes("cloudflare") || isChallengeHTML(resolved.bodyPrefix))) return true;
+    if (resolved.bodyPrefix && isChallengeHTML(resolved.bodyPrefix)) return true;
+    return false;
+  }
+
+  function combineSignals(primary, secondary) {
+    if (!primary) return secondary || null;
+    if (!secondary) return primary;
+    if (typeof AbortController !== "function") return primary;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (primary.aborted || secondary.aborted) {
+      controller.abort();
+      return controller.signal;
+    }
+    primary.addEventListener("abort", abort, { once: true });
+    secondary.addEventListener("abort", abort, { once: true });
+    return controller.signal;
   }
 
   function chooseArticleRoot(doc) {
@@ -21,6 +91,29 @@ var AutoFullTextTranslation = (function () {
     return candidates.reduce((best, candidate) =>
       !best || textLength(candidate) > textLength(best) ? candidate : best,
     null) || doc.body;
+  }
+
+  function hasUsableArticleBody(doc, currentURL = "") {
+    if (!doc || !doc.body) return false;
+    if (currentURL && isChallengeDocument(doc, currentURL)) return false;
+    const root = chooseArticleRoot(doc);
+    return Boolean(root && textLength(root) >= 500);
+  }
+
+  function hasUsableArticleHTML(html, currentURL = "") {
+    const raw = String(html || "");
+    if (!raw || isChallengeHTML(raw)) return false;
+    try {
+      if (typeof DOMParser === "function") {
+        const parsed = new DOMParser().parseFromString(raw, "text/html");
+        return hasUsableArticleBody(parsed, currentURL);
+      }
+    } catch {}
+    return raw.replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim().length >= 500;
   }
 
   function headingLevel(element) {
@@ -226,7 +319,7 @@ var AutoFullTextTranslation = (function () {
     return { bytes, mime: match[1].toLowerCase() };
   }
 
-  async function inlineImages(root, baseURL, workspace, signal) {
+  async function inlineImages(root, baseURL, workspace, signal, challengeAuth = null) {
     const images = Array.from(root.querySelectorAll("img"));
     if (images.length > imageLimits.count) throw new Error("The article contains too many images to safely export.");
     let totalBytes = 0;
@@ -252,7 +345,129 @@ var AutoFullTextTranslation = (function () {
       image.removeAttribute("data-lazy-src");
     };
 
-    const downloadImage = async (image, initialURL) => {
+    const applyInlinedImage = (image, bytes, contentType, resolvedURL) => {
+      if (!bytes.length || bytes.length > imageLimits.one) throw new Error("Image size is invalid or exceeds 12 MB.");
+      if (totalBytes + bytes.length > imageLimits.all) throw new Error("Article images exceed the 40 MB export limit.");
+      totalBytes += bytes.length;
+      let mime = String(contentType || "").split(";")[0].trim().toLowerCase();
+      if (mime === "image/svg+xml" || new URL(resolvedURL).pathname.toLowerCase().endsWith(".svg")) {
+        mime = "image/svg+xml";
+      } else if (!/^image\/(?:png|jpeg|gif|webp|avif)$/.test(mime)) {
+        throw new Error(`Unexpected or unsupported image response type ${mime || "(missing)"}.`);
+      }
+      const finalBytes = mime === "image/svg+xml" ? sanitizeSVG(bytes) : bytes;
+      image.setAttribute("src", `data:${mime};base64,${base64FromBytes(finalBytes)}`);
+      image.removeAttribute("srcset");
+      image.removeAttribute("data-srcset");
+      image.removeAttribute("data-src");
+      image.removeAttribute("data-original");
+      image.removeAttribute("data-lazy-src");
+      image.removeAttribute("loading");
+    };
+
+    const requestImageOnce = async (url, { anon = true, noCache = false, headers = {} } = {}) => {
+      let observedBytes = 0;
+      let oversized = false;
+      let cancelRequest = null;
+      const combinedSignal = controller.signal;
+      const abort = () => cancelRequest?.();
+      combinedSignal.addEventListener("abort", abort, { once: true });
+      signal?.addEventListener("abort", abort, { once: true });
+      let response;
+      try {
+        response = await Zotero.HTTP.request("GET", url, {
+          responseType: "arraybuffer",
+          timeout: 30000,
+          errorDelayMax: 0,
+          noCache,
+          anon,
+          followRedirects: false,
+          headers: {
+            Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            ...headers,
+          },
+          requestObserver(xhr) {
+            const cancelOversized = (message) => {
+              oversized = true;
+              failure = new Error(message);
+              controller.abort();
+              cancelRequest?.();
+            };
+            xhr.addEventListener("readystatechange", () => {
+              if (xhr.readyState < 2) return;
+              const contentLength = Number.parseInt(xhr.getResponseHeader("Content-Length") || "0", 10) || 0;
+              if (contentLength > imageLimits.one) cancelOversized("An image exceeds the 12 MB per-image limit.");
+              else if (totalBytes + inFlightBytes + contentLength > imageLimits.all) cancelOversized("Article images exceed the 40 MB export limit.");
+            });
+            xhr.addEventListener("progress", (event) => {
+              const current = Number(event.loaded || 0);
+              const delta = Math.max(0, current - observedBytes);
+              observedBytes = current;
+              inFlightBytes += delta;
+              if (observedBytes > imageLimits.one || Number(event.total || 0) > imageLimits.one) {
+                cancelOversized("An image exceeds the 12 MB per-image limit.");
+              } else if (totalBytes + inFlightBytes > imageLimits.all || totalBytes + Number(event.total || 0) > imageLimits.all) {
+                cancelOversized("Article images exceed the 40 MB export limit.");
+              }
+            });
+          },
+          cancellerReceiver(canceller) {
+            cancelRequest = canceller;
+            if (signal?.aborted || controller.signal.aborted) cancelRequest?.();
+          },
+        });
+      } catch (error) {
+        if (observedBytes) inFlightBytes = Math.max(0, inFlightBytes - observedBytes);
+        if (oversized) throw failure;
+        if (signal?.aborted || controller.signal.aborted) {
+          const cancelled = new Error("Image download cancelled.");
+          cancelled.name = "AbortError";
+          throw cancelled;
+        }
+        throw error;
+      } finally {
+        combinedSignal.removeEventListener("abort", abort);
+        signal?.removeEventListener("abort", abort);
+      }
+
+      if (observedBytes) inFlightBytes = Math.max(0, inFlightBytes - observedBytes);
+      if (signal?.aborted || controller.signal.aborted) {
+        const cancelled = new Error("Image download cancelled.");
+        cancelled.name = "AbortError";
+        throw cancelled;
+      }
+      return response;
+    };
+
+    const downloadImageViaChallenge = async (image, url) => {
+      const remainingBudget = Math.max(0, imageLimits.all - totalBytes);
+      const maxAllowed = Math.min(imageLimits.one, remainingBudget);
+      if (maxAllowed <= 0) throw new Error("Article images exceed the 40 MB export limit.");
+      if (typeof challengeAuth?.handle?.fetchInWindow === "function") {
+        try {
+          const fetched = await challengeAuth.handle.fetchInWindow(
+            url,
+            challengeAuth.referrerURL || baseURL,
+            maxAllowed,
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+          );
+          if (fetched.status >= 200 && fetched.status < 300) {
+            const finalURL = fetched.responseURL
+              ? AutoFullText.validateResourceURL(fetched.responseURL, baseURL)
+              : url;
+            applyInlinedImage(image, fetched.bytes, fetched.getHeader("content-type"), finalURL);
+            return true;
+          }
+        } catch (error) {
+          if (signal?.aborted || controller.signal.aborted || error?.name === "AbortError") throw error;
+          if (/exceeds the .*limit|12 MB|40 MB/i.test(String(error?.message || ""))) throw error;
+          // Fall back to authenticated session HTTP request below.
+        }
+      }
+      return false;
+    };
+
+    const downloadImage = async (image, initialURL, { useVerifiedSession = false } = {}) => {
       let url = AutoFullText.validateResourceURL(initialURL, baseURL);
       const visited = new Set();
       for (let redirects = 0; redirects <= 5; redirects += 1) {
@@ -260,72 +475,28 @@ var AutoFullTextTranslation = (function () {
         if (visited.has(url)) throw new Error("Image redirect loop detected.");
         visited.add(url);
 
-        let observedBytes = 0;
-        let oversized = false;
-        let cancelRequest = null;
-        const combinedSignal = controller.signal;
-        const abort = () => cancelRequest?.();
-        combinedSignal.addEventListener("abort", abort, { once: true });
-        signal?.addEventListener("abort", abort, { once: true });
+        const requestOpts = useVerifiedSession
+          ? {
+            anon: false,
+            noCache: true,
+            headers: {
+              ...(challengeAuth?.referrerURL ? { Referer: challengeAuth.referrerURL } : {}),
+              ...(challengeAuth?.userAgent ? { "User-Agent": challengeAuth.userAgent } : {}),
+            },
+          }
+          : { anon: true };
+
         let response;
         try {
-          response = await Zotero.HTTP.request("GET", url, {
-            responseType: "arraybuffer",
-            timeout: 30000,
-            errorDelayMax: 0,
-            anon: true,
-            followRedirects: false,
-            headers: { Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" },
-            requestObserver(xhr) {
-              const cancelOversized = (message) => {
-                oversized = true;
-                failure = new Error(message);
-                controller.abort();
-                cancelRequest?.();
-              };
-              xhr.addEventListener("readystatechange", () => {
-                if (xhr.readyState < 2) return;
-                const contentLength = Number.parseInt(xhr.getResponseHeader("Content-Length") || "0", 10) || 0;
-                if (contentLength > imageLimits.one) cancelOversized("An image exceeds the 12 MB per-image limit.");
-                else if (totalBytes + inFlightBytes + contentLength > imageLimits.all) cancelOversized("Article images exceed the 40 MB export limit.");
-              });
-              xhr.addEventListener("progress", (event) => {
-                const current = Number(event.loaded || 0);
-                const delta = Math.max(0, current - observedBytes);
-                observedBytes = current;
-                inFlightBytes += delta;
-                if (observedBytes > imageLimits.one || Number(event.total || 0) > imageLimits.one) {
-                  cancelOversized("An image exceeds the 12 MB per-image limit.");
-                } else if (totalBytes + inFlightBytes > imageLimits.all || totalBytes + Number(event.total || 0) > imageLimits.all) {
-                  cancelOversized("Article images exceed the 40 MB export limit.");
-                }
-              });
-            },
-            cancellerReceiver(canceller) {
-              cancelRequest = canceller;
-              if (signal?.aborted || controller.signal.aborted) cancelRequest?.();
-            },
-          });
+          response = await requestImageOnce(url, requestOpts);
         } catch (error) {
-          if (observedBytes) inFlightBytes = Math.max(0, inFlightBytes - observedBytes);
-          if (oversized) throw failure;
-          if (signal?.aborted || controller.signal.aborted) {
-            const cancelled = new Error("Image download cancelled.");
-            cancelled.name = "AbortError";
-            throw cancelled;
+          if (!useVerifiedSession && challengeAuth && isChallengeHTTP(error)) {
+            if (await downloadImageViaChallenge(image, url)) return;
+            return downloadImage(image, url, { useVerifiedSession: true });
           }
           throw error;
-        } finally {
-          combinedSignal.removeEventListener("abort", abort);
-          signal?.removeEventListener("abort", abort);
         }
 
-        if (observedBytes) inFlightBytes = Math.max(0, inFlightBytes - observedBytes);
-        if (signal?.aborted || controller.signal.aborted) {
-          const cancelled = new Error("Image download cancelled.");
-          cancelled.name = "AbortError";
-          throw cancelled;
-        }
         const status = Number(response.status || 0);
         if ([301, 302, 303, 307, 308].includes(status)) {
           if (redirects === 5) throw new Error("Image exceeded the redirect limit.");
@@ -334,27 +505,15 @@ var AutoFullTextTranslation = (function () {
           url = AutoFullText.validateRedirectURL(new URL(location, url).href, url, baseURL);
           continue;
         }
+        if ((status === 403 || status === 503) && !useVerifiedSession && challengeAuth) {
+          if (await downloadImageViaChallenge(image, url)) return;
+          return downloadImage(image, url, { useVerifiedSession: true });
+        }
         if (status < 200 || status >= 300) throw new Error(`Image returned HTTP ${status}.`);
         if (response.responseURL) AutoFullText.validateResourceURL(response.responseURL, baseURL);
         const buffer = response.response;
         const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || new ArrayBuffer(0));
-        if (!bytes.length || bytes.length > imageLimits.one) throw new Error("Image size is invalid or exceeds 12 MB.");
-        if (totalBytes + bytes.length > imageLimits.all) throw new Error("Article images exceed the 40 MB export limit.");
-        totalBytes += bytes.length;
-        let mime = String(response.getResponseHeader("Content-Type") || "").split(";")[0].trim().toLowerCase();
-        if (mime === "image/svg+xml" || new URL(url).pathname.toLowerCase().endsWith(".svg")) {
-          mime = "image/svg+xml";
-        } else if (!/^image\/(?:png|jpeg|gif|webp|avif)$/.test(mime)) {
-          throw new Error(`Unexpected or unsupported image response type ${mime || "(missing)"}.`);
-        }
-        const finalBytes = mime === "image/svg+xml" ? sanitizeSVG(bytes) : bytes;
-        image.setAttribute("src", `data:${mime};base64,${base64FromBytes(finalBytes)}`);
-        image.removeAttribute("srcset");
-        image.removeAttribute("data-srcset");
-        image.removeAttribute("data-src");
-        image.removeAttribute("data-original");
-        image.removeAttribute("data-lazy-src");
-        image.removeAttribute("loading");
+        applyInlinedImage(image, bytes, response.getResponseHeader("Content-Type"), url);
         return;
       }
       throw new Error("Image download did not complete.");
@@ -614,10 +773,10 @@ var AutoFullTextTranslation = (function () {
     }
   }
 
-  function emitProgress(onProgress, stage, percent) {
+  function emitProgress(onProgress, stage, percent, extra = null) {
     if (typeof onProgress !== "function") return;
     try {
-      onProgress({ stage, percent });
+      onProgress(extra ? { stage, percent, ...extra } : { stage, percent });
     } catch {
       // Ignore UI progress callback failures.
     }
@@ -820,7 +979,7 @@ var AutoFullTextTranslation = (function () {
     return content;
   }
 
-  async function capturePageStyles(doc, baseURL, signal) {
+  async function capturePageStyles(doc, baseURL, signal, challengeAuth = null) {
     const entries = [];
     const styleNodes = Array.from(doc.querySelectorAll("link[rel~=stylesheet][href],style")).slice(0, 24);
     for (const node of styleNodes) {
@@ -837,15 +996,53 @@ var AutoFullTextTranslation = (function () {
       }
     }
 
-    const loadedStyles = await mapConcurrentOrdered(entries, async (entry) => {
-      if (!entry.href) return entry;
+    const fetchStylesheet = async (href) => {
       try {
-        const response = await AutoFullText.fetchTextResource(entry.href, {
+        return await AutoFullText.fetchTextResource(href, {
           baseURL,
           signal,
           headers: { Accept: "text/css,*/*;q=0.1" },
           maxBytes: 2 * 1024 * 1024,
         });
+      } catch (error) {
+        if (signal?.aborted || error?.name === "AbortError" || !challengeAuth) throw error;
+        if (typeof challengeAuth.handle?.fetchInWindow === "function") {
+          try {
+            const fetched = await challengeAuth.handle.fetchInWindow(
+              href,
+              challengeAuth.referrerURL || baseURL,
+              2 * 1024 * 1024,
+              "text/css,*/*;q=0.1",
+            );
+            if (fetched.status >= 200 && fetched.status < 300) {
+              return {
+                text: new TextDecoder("utf-8").decode(fetched.bytes),
+                contentType: fetched.getHeader("content-type"),
+              };
+            }
+          } catch (windowError) {
+            if (signal?.aborted || windowError?.name === "AbortError") throw windowError;
+          }
+        }
+        return AutoFullText.fetchTextResource(href, {
+          baseURL,
+          signal,
+          noCache: true,
+          anon: false,
+          headers: {
+            Accept: "text/css,*/*;q=0.1",
+            ...(challengeAuth.referrerURL ? { Referer: challengeAuth.referrerURL } : {}),
+            ...(challengeAuth.userAgent ? { "User-Agent": challengeAuth.userAgent } : {}),
+          },
+          maxBytes: 2 * 1024 * 1024,
+        });
+      }
+    };
+
+    const loadedStyles = await mapConcurrentOrdered(entries, async (entry) => {
+      if (!entry.href) return entry;
+      try {
+        const response = await fetchStylesheet(entry.href);
         if (response.contentType && !/^text\/css(?:\s*;|$)/i.test(response.contentType)) {
           throw new Error(`Stylesheet URL returned ${response.contentType}, not CSS.`);
         }
@@ -871,13 +1068,168 @@ var AutoFullTextTranslation = (function () {
     return { styles, bodyAttributes };
   }
 
-  async function snapshotArticle(url, workspace, signal, onProgress = null) {
-    const { doc, responseURL } = await AutoFullText.fetchDocument(url, {
+  async function snapshotArticleViaChallenge(challengeURL, workspace, signal, onProgress, { challengeInitTimeoutMs } = {}) {
+    const canOpenChallenge = typeof AutoFullTextSupportingInfo !== "undefined" &&
+      typeof AutoFullTextSupportingInfo?.openChallengeSession === "function" &&
+      typeof Zotero.getMainWindow?.()?.openDialog === "function";
+    if (!canOpenChallenge) {
+      throw Object.assign(new Error("出版商页面触发了 Cloudflare / 安全验证，当前无法打开验证窗口。"), {
+        name: "FullTextAccessError",
+        publisherURL: challengeURL,
+      });
+    }
+    const userAgent = AutoFullTextSupportingInfo.getBrowserUserAgent?.() || "";
+    emitProgress(onProgress, "检测到 Cloudflare / 安全验证，正在尝试自动跳过或打开验证窗口…", 10);
+    return AutoFullTextSupportingInfo.openChallengeSession(challengeURL, {
+      mode: "translation",
       signal,
-      headers: { Accept: "text/html,application/xhtml+xml" },
-      maxBytes: 30 * 1024 * 1024,
-      onRawText: (text) => workspace.writeText("article-page-original.html", text),
+      userAgent,
+      onProgress,
+      ...(challengeInitTimeoutMs ? { initTimeoutMs: challengeInitTimeoutMs } : {}),
+      windowTitle: "Zotero PaperFlow — 全文翻译安全验证",
+      extractLabel: "已通过，立即提取正文",
+      cancelErrorName: "FullTextChallengeCancelledError",
+      cancelErrorMessage: "已取消安全验证，全文翻译已停止。",
+      accessErrorName: "FullTextAccessError",
+      hasArticleContent: (doc, currentURL) => hasUsableArticleBody(doc, currentURL),
+      hasArticleContentHTML: (htmlText, currentURL) => hasUsableArticleHTML(htmlText, currentURL),
+      async onVerified({ doc, responseURL, html, handle }) {
+        const activeSignal = combineSignals(signal, handle?.signal || null);
+        throwIfAborted(activeSignal);
+        let activeURL = AutoFullText.validateArticleURL(responseURL || challengeURL);
+        let activeHTML = String(html || "");
+        if (!activeHTML && doc?.documentElement) {
+          try {
+            activeHTML = String(doc.documentElement.outerHTML || "");
+          } catch {
+            activeHTML = "";
+          }
+        }
+        if (!activeHTML) {
+          handle?.setStatus?.("验证已通过，正在使用已验证会话读取文章网页…", activeURL);
+          emitProgress(onProgress, "验证已通过，正在读取文章网页…", 16);
+          const fetched = await AutoFullText.fetchDocument(activeURL, {
+            signal: activeSignal,
+            noCache: true,
+            anon: false,
+            headers: {
+              Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              ...(userAgent ? { "User-Agent": userAgent } : {}),
+            },
+            maxBytes: 30 * 1024 * 1024,
+            onRawText: (text) => workspace.writeText("article-page-original.html", text),
+          });
+          activeHTML = fetched.rawText;
+          activeURL = fetched.responseURL;
+        } else {
+          if (activeHTML.length * 2 > 30 * 1024 * 1024 + 65536) {
+            throw new Error("HTTP resource exceeded its in-memory size limit.");
+          }
+          await workspace.writeText("article-page-original.html", activeHTML);
+        }
+
+        if (isChallengeHTML(activeHTML)) {
+          throw Object.assign(new Error("安全验证尚未通过，仍停留在出版商验证页。"), {
+            name: "FullTextAccessError",
+            publisherURL: activeURL,
+          });
+        }
+
+        const parsedDoc = new DOMParser().parseFromString(activeHTML, "text/html");
+        if (!parsedDoc.documentElement || parsedDoc.querySelector("parsererror")) {
+          throw new Error("Article page returned invalid HTML.");
+        }
+
+        handle?.setStatus?.("验证已通过，正在去除非正文部分并捕获页面样式…", activeURL);
+        emitProgress(onProgress, "验证已通过，正在清洗正文并捕获页面样式…", 18);
+        const challengeAuth = { handle, userAgent, referrerURL: activeURL };
+        const parsedRoot = chooseArticleRoot(parsedDoc);
+        const pageStyles = await capturePageStyles(parsedDoc, activeURL, activeSignal, challengeAuth);
+        const root = wrapWithAncestors(parsedRoot, parsedDoc);
+        let canvasCaptured = false;
+        if (doc && doc !== parsedDoc) {
+          try {
+            const liveRoot = chooseArticleRoot(doc);
+            if (liveRoot) {
+              captureCanvas(liveRoot, root);
+              canvasCaptured = true;
+            }
+          } catch {
+            canvasCaptured = false;
+          }
+        }
+        if (!canvasCaptured) captureCanvas(parsedRoot, root);
+        normalizeMathMarkup(root);
+        removeUnwantedContent(root, activeURL);
+        const cleanedHTML = root.outerHTML;
+        if (textLength(root) < 500) {
+          throw new Error("The cleaned article body is too short to translate.");
+        }
+
+        handle?.setStatus?.("正在提取并内联文章图片资源…", activeURL);
+        emitProgress(onProgress, "验证已通过，正在内联文章图片资源…", 26);
+        await inlineImages(root, activeURL, workspace, activeSignal, challengeAuth);
+        throwIfAborted(activeSignal);
+        handle?.setStatus?.("正文与图片提取完成，正在关闭验证窗口并开始翻译…", activeURL);
+        return {
+          html: root.outerHTML,
+          cleanedHTML,
+          responseURL: activeURL,
+          ...pageStyles,
+          imagesInlined: true,
+          usedChallengeWindow: true,
+        };
+      },
     });
+  }
+
+  async function snapshotArticle(url, workspace, signal, onProgress = null, { allowChallengeWindow = true, challengeInitTimeoutMs } = {}) {
+    let lastAttemptURL = url;
+    let lastResponseInfo = null;
+    let fetched = null;
+    let needsChallenge = false;
+    try {
+      fetched = await AutoFullText.fetchDocument(url, {
+        signal,
+        headers: { Accept: "text/html,application/xhtml+xml" },
+        maxBytes: 30 * 1024 * 1024,
+        onRawText: (text) => workspace.writeText("article-page-original.html", text),
+        onResponse: (response, requestURL) => {
+          if (requestURL) lastAttemptURL = requestURL;
+          lastResponseInfo = extractResponseInfo(response);
+        },
+      });
+      if (isChallengeHTML(fetched.rawText)) {
+        needsChallenge = true;
+        lastAttemptURL = fetched.responseURL || lastAttemptURL;
+      }
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") throw error;
+      const info = extractResponseInfo(error);
+      const mergedInfo = {
+        status: info.status || lastResponseInfo?.status || 0,
+        cfMitigated: info.cfMitigated || lastResponseInfo?.cfMitigated || "",
+        server: info.server || lastResponseInfo?.server || "",
+        bodyPrefix: info.bodyPrefix || lastResponseInfo?.bodyPrefix || "",
+      };
+      if (allowChallengeWindow && isChallengeHTTP(error, mergedInfo)) {
+        needsChallenge = true;
+      } else {
+        throw error;
+      }
+    }
+
+    if (needsChallenge) {
+      if (!allowChallengeWindow) {
+        throw Object.assign(new Error("出版商页面触发了 Cloudflare / 安全验证。"), {
+          name: "FullTextAccessError",
+          publisherURL: lastAttemptURL,
+        });
+      }
+      return snapshotArticleViaChallenge(lastAttemptURL, workspace, signal, onProgress, { challengeInitTimeoutMs });
+    }
+
+    const { doc, responseURL } = fetched;
     emitProgress(onProgress, "正在清洗正文并捕获页面样式…", 18);
     const sourceRoot = chooseArticleRoot(doc);
     const pageStyles = await capturePageStyles(doc, responseURL, signal);
@@ -885,7 +1237,7 @@ var AutoFullTextTranslation = (function () {
     captureCanvas(sourceRoot, root);
     normalizeMathMarkup(root);
     removeUnwantedContent(root, responseURL);
-    return { html: root.outerHTML, responseURL, ...pageStyles };
+    return { html: root.outerHTML, responseURL, ...pageStyles, imagesInlined: false, usedChallengeWindow: false };
   }
 
   function throwIfAborted(signal) {
@@ -896,6 +1248,9 @@ var AutoFullTextTranslation = (function () {
   }
 
   async function create(item, signal = null, { onProgress = null } = {}) {
+    const extraOptions = arguments[2] && typeof arguments[2] === "object" ? arguments[2] : {};
+    const allowChallengeWindow = extraOptions.allowChallengeWindow !== false;
+    const challengeInitTimeoutMs = extraOptions.challengeInitTimeoutMs;
     const url = AutoFullText.itemURL(item);
     if (!url) throw new Error("This item has neither a webpage URL nor DOI.");
     const workspace = await AutoFullTextPdf.createWorkspace();
@@ -911,9 +1266,13 @@ var AutoFullTextTranslation = (function () {
       throwIfAborted(signal);
       emitProgress(onProgress, "正在读取并解析文章网页…", 8);
       await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));
-      const snapshot = await snapshotArticle(url, workspace, signal, onProgress);
+      const snapshot = await snapshotArticle(url, workspace, signal, onProgress, {
+        allowChallengeWindow,
+        challengeInitTimeoutMs,
+      });
       throwIfAborted(signal);
-      await workspace.writeText("article-page-cleaned.html", snapshot.html);
+      runInfo.usedChallengeWindow = Boolean(snapshot.usedChallengeWindow);
+      await workspace.writeText("article-page-cleaned.html", snapshot.cleanedHTML || snapshot.html);
       runInfo.stage = "article page saved";
       await workspace.writeText("run-info.json", JSON.stringify(runInfo, null, 2));
 
@@ -921,9 +1280,11 @@ var AutoFullTextTranslation = (function () {
       const root = doc.body.firstElementChild;
       if (!root || textLength(root) < 500) throw new Error("The cleaned article body is too short to translate.");
 
-      emitProgress(onProgress, "正在内联文章图片资源…", 26);
-      await inlineImages(root, snapshot.responseURL, workspace, signal);
-      throwIfAborted(signal);
+      if (!snapshot.imagesInlined) {
+        emitProgress(onProgress, "正在内联文章图片资源…", 26);
+        await inlineImages(root, snapshot.responseURL, workspace, signal);
+        throwIfAborted(signal);
+      }
       await workspace.writeText("article-page-assets-inlined.html", root.outerHTML);
       const provider = AutoFullTextTranslator.getActiveProvider();
       const systemPrompt = AutoFullTextTranslator.getSystemPrompt(item);
@@ -984,6 +1345,14 @@ var AutoFullTextTranslation = (function () {
         cancelled.name = "AbortError";
         throw cancelled;
       }
+      if (error?.name === "FullTextChallengeCancelledError") {
+        try {
+          await workspace.cleanup();
+        } catch (cleanupError) {
+          AutoFullText.log(`Cancelled translation challenge workspace could not be cleaned at ${workspace.path}`, cleanupError);
+        }
+        throw error;
+      }
       runInfo.stage = "failed";
       runInfo.error = detail;
       try {
@@ -1004,7 +1373,11 @@ var AutoFullTextTranslation = (function () {
     } catch (error) {
       AutoFullText.log(`Translation attached successfully, but intermediate files could not be removed from ${workspace.path}`, error);
     }
-    return { translatedParagraphs: runInfo.translatedParagraphs, translatedSegments: runInfo.translatedSegments };
+    return {
+      translatedParagraphs: runInfo.translatedParagraphs,
+      translatedSegments: runInfo.translatedSegments,
+      usedChallengeWindow: Boolean(runInfo.usedChallengeWindow),
+    };
   }
 
   return {

@@ -696,19 +696,28 @@ var AutoFullTextSupportingInfo = (function () {
     onVerified,
     onProgress = null,
     initTimeoutMs = CHALLENGE_INIT_TIMEOUT_MS,
+    mode = "article",
+    windowTitle = "",
+    extractLabel = "",
+    hasArticleContent = null,
+    hasArticleContentHTML = null,
+    cancelErrorName = "SupportingInfoChallengeCancelledError",
+    cancelErrorMessage = "",
+    accessErrorName = "SupportingInfoAccessError",
   }) {
+    const isTranslationMode = mode === "translation";
     const validatedURL = AutoFullText.validateArticleURL(challengeURL);
     const mainWin = Zotero.getMainWindow?.();
     if (!mainWin || typeof mainWin.openDialog !== "function") {
       throw Object.assign(new Error("无法打开 Zotero 安全验证窗口。"), {
-        name: "SupportingInfoAccessError",
+        name: accessErrorName,
         publisherURL: validatedURL,
       });
     }
     const launch = () => {
       throwIfAborted(signal);
       return new Promise((resolve, reject) => {
-        const sid = `si-${Zotero.Utilities.randomString(10)}`;
+        const sid = `${isTranslationMode ? "tr" : "si"}-${Zotero.Utilities.randomString(10)}`;
         if (!(Zotero._autoFullTextChallengeSessions instanceof Map)) {
           Zotero._autoFullTextChallengeSessions = new Map();
         }
@@ -738,33 +747,51 @@ var AutoFullTextSupportingInfo = (function () {
         };
         const onExternalAbort = () => {
           try { dialogRef?.close?.(); } catch {}
-          finishReject(Object.assign(new Error("Supporting information verification cancelled."), { name: "AbortError" }));
+          finishReject(Object.assign(
+            new Error(isTranslationMode ? "Full-text translation verification cancelled." : "Supporting information verification cancelled."),
+            { name: "AbortError" },
+          ));
         };
         signal?.addEventListener("abort", onExternalAbort, { once: true });
 
         const args = {
           url: validatedURL,
+          mode,
+          windowTitle,
+          extractLabel,
+          cancelErrorName,
+          cancelErrorMessage,
+          accessErrorName,
           userAgent,
           signal,
           isChallengeDocument,
           isBlockedHost: (host) => AutoFullText.isLocalHost?.(host) || AutoFullText.isIPAddress?.(host) || false,
-          hasSupportingLink: (doc, currentURL) => Boolean(extractSupportingLink(doc, currentURL)),
-          hasSupportingLinkHTML: (htmlText, currentURL) => {
-            try {
-              if (typeof DOMParser === "function" && htmlText) {
-                const parsed = new DOMParser().parseFromString(htmlText, "text/html");
-                return Boolean(extractSupportingLink(parsed, currentURL, htmlText));
-              }
-            } catch {}
-            return Boolean(extractSupportingLinkFromHTML(htmlText, currentURL));
-          },
+          hasSupportingLink: isTranslationMode ? null : (doc, currentURL) => Boolean(extractSupportingLink(doc, currentURL)),
+          hasSupportingLinkHTML: isTranslationMode
+            ? null
+            : (htmlText, currentURL) => {
+              try {
+                if (typeof DOMParser === "function" && htmlText) {
+                  const parsed = new DOMParser().parseFromString(htmlText, "text/html");
+                  return Boolean(extractSupportingLink(parsed, currentURL, htmlText));
+                }
+              } catch {}
+              return Boolean(extractSupportingLinkFromHTML(htmlText, currentURL));
+            },
+          hasArticleContent: typeof hasArticleContent === "function" ? hasArticleContent : null,
+          hasArticleContentHTML: typeof hasArticleContentHTML === "function" ? hasArticleContentHTML : null,
           onWindowReady: (readyWin) => {
             if (initTimer) {
               clearTimeout(initTimer);
               initTimer = null;
             }
             if (readyWin) dialogRef = readyWin;
-            emitProgress(onProgress, "等待出版商安全验证（自动跳过或手动完成）…", 40, { challengeWindow: dialogRef });
+            emitProgress(
+              onProgress,
+              "等待出版商安全验证（自动跳过或手动完成）…",
+              isTranslationMode ? 14 : 40,
+              { challengeWindow: dialogRef },
+            );
           },
           onStatus: (statusText) => {
             if (statusText) emitProgress(onProgress, statusText, null, { challengeWindow: dialogRef });
@@ -776,31 +803,31 @@ var AutoFullTextSupportingInfo = (function () {
         Zotero._autoFullTextChallengeSessions.set(sid, args);
         const wrapped = { wrappedJSObject: args };
         try {
-          emitProgress(onProgress, "需要安全验证，正在打开验证窗口…", 30);
+          emitProgress(onProgress, "需要安全验证，正在打开验证窗口…", isTranslationMode ? 12 : 30);
           initTimer = setTimeout(() => {
             if (finished) return;
             try { dialogRef?.close?.(); } catch {}
             finishReject(Object.assign(new Error("安全验证窗口未能正常初始化，请检查插件安装或重试。"), {
-              name: "SupportingInfoAccessError",
+              name: accessErrorName,
               publisherURL: validatedURL,
             }));
           }, initTimeoutMs);
           dialogRef = mainWin.openDialog(
             `${CHALLENGE_WINDOW_URL}?sid=${encodeURIComponent(sid)}`,
-            `zotero-auto-fulltext-si-challenge-${Zotero.Utilities.randomString(6)}`,
+            `zotero-auto-fulltext-${isTranslationMode ? "tr" : "si"}-challenge-${Zotero.Utilities.randomString(6)}`,
             "chrome,centerscreen,resizable,scrollbars,width=980,height=740",
             wrapped,
           );
           dialogRef?.focus?.();
           if (!dialogRef) {
             finishReject(Object.assign(new Error("Zotero 未能弹出安全验证窗口。"), {
-              name: "SupportingInfoAccessError",
+              name: accessErrorName,
               publisherURL: validatedURL,
             }));
           }
         } catch (error) {
           finishReject(Object.assign(new Error(`无法打开安全验证窗口：${String(error?.message || error)}`), {
-            name: "SupportingInfoAccessError",
+            name: accessErrorName,
             publisherURL: validatedURL,
           }));
         }
@@ -1096,6 +1123,7 @@ var AutoFullTextSupportingInfo = (function () {
 
   return {
     addForItem,
+    openChallengeSession,
     resetSessionState,
     isChallengeHTML,
     isChallengeDocument,

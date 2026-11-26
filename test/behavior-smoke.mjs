@@ -1832,6 +1832,483 @@ assert.equal(siWorkspaceCleaned, true);
       "raw HTML fallback must decode JSON-escaped subdomain suppdata URLs with query strings",
     );
   }
+
+  // Scenario N: challenge-window.js in mode="translation" customizes title/button, auto-extracts via PageData actor, and cancels with FullTextChallengeCancelledError
+  {
+    const statusHistory = [];
+    const statusEl = {
+      _text: "",
+      get textContent() { return this._text; },
+      set textContent(v) { this._text = v; statusHistory.push(v); },
+    };
+    const urlEl = { textContent: "" };
+    const extractBtn = { textContent: "已通过，立即提取 SI", addEventListener: () => {} };
+    const cancelListeners = [];
+    const cancelBtn = {
+      addEventListener: (type, fn) => { if (type === "click") cancelListeners.push(fn); },
+      click() { for (const fn of cancelListeners) fn(); },
+    };
+    const noopBtn = () => ({ addEventListener: () => {} });
+    let phase = "challenge";
+    let verifiedTranslationPayload = null;
+    const trArticleURL = "https://pubs.rsc.org/en/content/articlehtml/2026/ee/d6ee05315g";
+    const challengeHTML = '<html><head><title>Just a moment...</title></head><body><div id="challenge-running">Checking your browser</div></body></html>';
+    const verifiedBodyText = "Perovskite photovoltaics achieve high efficiency via interfacial passivation. ".repeat(12);
+    const verifiedHTML = `<html><head><title>Perovskite Article</title></head><body><nav>Navigation</nav><article><p>${verifiedBodyText}</p></article></body></html>`;
+    const trBrowser = {
+      browsingContext: {
+        customUserAgent: "",
+        currentWindowGlobal: {
+          documentURI: { spec: trArticleURL },
+          getActor: (name) => name === "PageData" ? {
+            sendQuery: async (query) => {
+              if (query === "title") return phase === "challenge" ? "Just a moment..." : "Perovskite Article";
+              if (query === "documentHTML") return phase === "challenge" ? challengeHTML : verifiedHTML;
+              return null;
+            },
+          } : null,
+        },
+      },
+      docShell: null,
+      currentURI: null,
+      contentDocument: null,
+      contentWindow: null,
+      addEventListener: () => {},
+      addProgressListener: () => {},
+      removeProgressListener: () => {},
+      fixupAndLoadURIString: () => {},
+      setAttribute: () => {},
+    };
+    const trSession = {
+      url: trArticleURL,
+      mode: "translation",
+      windowTitle: "Zotero PaperFlow — 全文翻译安全验证",
+      extractLabel: "已通过，立即提取正文",
+      userAgent: "Mozilla/5.0 Firefox/140.0",
+      hasArticleContentHTML: (htmlText) => htmlText.includes("Perovskite photovoltaics"),
+      onVerified: async (payload) => { verifiedTranslationPayload = payload; return { ok: true }; },
+      resolve: () => {},
+      reject: () => {},
+    };
+    const trDoc = {
+      title: "Zotero PaperFlow — 出版商安全验证",
+      readyState: "complete",
+      getElementById: (id) => ({
+        "si-challenge-status": statusEl,
+        "si-challenge-url": urlEl,
+        "si-challenge-reload": noopBtn(),
+        "si-challenge-extract": extractBtn,
+        "si-challenge-cancel": cancelBtn,
+        "si-challenge-browser": trBrowser,
+      })[id] || null,
+    };
+    const trContext = {
+      window: {
+        location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=tr1" },
+        arguments: [{ wrappedJSObject: trSession }],
+        addEventListener: () => {},
+        close: () => {},
+      },
+      document: trDoc,
+      Services: mockServices,
+      Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+      URL,
+      Uint8Array,
+      AbortController,
+      setInterval,
+      clearInterval,
+      setTimeout,
+      clearTimeout,
+      Date,
+    };
+    vm.createContext(trContext);
+    vm.runInContext(read("content/challenge-window.js"), trContext);
+    assert.equal(trDoc.title, "Zotero PaperFlow — 全文翻译安全验证", "translation mode must update challenge window title");
+    assert.equal(extractBtn.textContent, "已通过，立即提取正文", "translation mode must customize manual extract button label");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(verifiedTranslationPayload, null, "translation mode must wait while Cloudflare challenge is active");
+    phase = "verified";
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    assert.ok(verifiedTranslationPayload, "translation mode must auto-extract once challenge clears and article body is present");
+    assert.equal(verifiedTranslationPayload.responseURL, trArticleURL);
+    assert.ok(verifiedTranslationPayload.html.includes("Perovskite photovoltaics"));
+
+    // Verify clicking Cancel in translation mode rejects with FullTextChallengeCancelledError
+    let cancelErr = null;
+    const cancelBtn2Listeners = [];
+    const cancelBtn2 = {
+      addEventListener: (type, fn) => { if (type === "click") cancelBtn2Listeners.push(fn); },
+      click() { for (const fn of cancelBtn2Listeners) fn(); },
+    };
+    const trCancelSession = {
+      url: trArticleURL,
+      mode: "translation",
+      userAgent: "Mozilla/5.0 Firefox/140.0",
+      onVerified: async () => ({ ok: true }),
+      resolve: () => {},
+      reject: (err) => { cancelErr = err; },
+    };
+    const trCancelContext = {
+      ...trContext,
+      window: {
+        location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=tr2" },
+        arguments: [{ wrappedJSObject: trCancelSession }],
+        addEventListener: () => {},
+        close: () => {},
+      },
+      document: {
+        title: "",
+        readyState: "complete",
+        getElementById: (id) => ({
+          "si-challenge-status": { textContent: "" },
+          "si-challenge-url": { textContent: "" },
+          "si-challenge-reload": noopBtn(),
+          "si-challenge-extract": { textContent: "", addEventListener: () => {} },
+          "si-challenge-cancel": cancelBtn2,
+          "si-challenge-browser": {
+            browsingContext: { customUserAgent: "" },
+            addEventListener: () => {},
+            addProgressListener: () => {},
+            removeProgressListener: () => {},
+            fixupAndLoadURIString: () => {},
+            setAttribute: () => {},
+          },
+        })[id] || null,
+      },
+    };
+    vm.createContext(trCancelContext);
+    vm.runInContext(read("content/challenge-window.js"), trCancelContext);
+    cancelBtn2.click();
+    assert.equal(cancelErr?.name, "FullTextChallengeCancelledError", "cancelling translation challenge window must reject with FullTextChallengeCancelledError");
+  }
+
+  // Scenario O: Full-text translation encountering Cloudflare 403 -> opens translation challenge window -> strips non-body -> inlines CF-protected image -> translates -> prints & attaches PDF
+  {
+    const cfArticleURL = "https://pubs.rsc.org/en/content/articlehtml/2026/ee/d6ee05315g";
+    const cfImageURL = "https://pubs.rsc.org/en/content/figure/fig1.png";
+    const cfParagraphText = "Interfacial defect passivation substantially suppresses nonradiative recombination in perovskite solar cells and improves operational stability under continuous illumination. ".repeat(4).trim();
+    const cfParagraphZh = "表层缺陷钝化显著抑制了钙钛矿太阳能电池中的非辐射复合，并在持续光照条件下显著提升了器件的长期工作稳定性。表层缺陷钝化显著抑制了钙钛矿太阳能电池中的非辐射复合，并在持续光照条件下显著提升了器件的长期工作稳定性。表层缺陷钝化显著抑制了钙钛矿太阳能电池中的非辐射复合，并在持续光照条件下显著提升了器件的长期工作稳定性。";
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x01]);
+    const writtenFiles = new Map();
+    let workspaceCleaned = false;
+    let attachedTitle = "";
+    let printedHtml = "";
+    let inWindowImageFetches = 0;
+    let openChallengeCalls = [];
+    const progressStages = [];
+
+    // Minimal DOM implementation sufficient for snapshotArticleViaChallenge -> removeUnwantedContent -> inlineImages -> translateBlocks
+    class MiniNode {
+      constructor(nodeType, tagName = "") {
+        this.nodeType = nodeType;
+        this.localName = tagName.toLowerCase();
+        this.tagName = tagName.toUpperCase();
+        this.parentNode = null;
+        this.childNodes = [];
+        this._attrs = new Map();
+        this._text = "";
+        this.ownerDocument = null;
+      }
+      get parentElement() { return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null; }
+      get children() { return this.childNodes.filter((n) => n.nodeType === 1); }
+      get firstElementChild() { return this.children[0] || null; }
+      get nextSibling() {
+        if (!this.parentNode) return null;
+        const idx = this.parentNode.childNodes.indexOf(this);
+        return idx >= 0 ? this.parentNode.childNodes[idx + 1] || null : null;
+      }
+      get attributes() {
+        return Array.from(this._attrs.entries()).map(([name, value]) => ({ name, value }));
+      }
+      getAttribute(name) { return this._attrs.has(name) ? this._attrs.get(name) : null; }
+      setAttribute(name, value) { this._attrs.set(name, String(value)); }
+      removeAttribute(name) { this._attrs.delete(name); }
+      removeAttributeNode(attr) { this._attrs.delete(attr.name); }
+      appendChild(child) {
+        if (child.nodeType === 11) {
+          for (const grand of [...child.childNodes]) this.appendChild(grand);
+          return child;
+        }
+        if (child.parentNode) child.parentNode.removeChild(child);
+        child.parentNode = this;
+        child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
+        this.childNodes.push(child);
+        return child;
+      }
+      removeChild(child) {
+        const idx = this.childNodes.indexOf(child);
+        if (idx >= 0) {
+          this.childNodes.splice(idx, 1);
+          child.parentNode = null;
+        }
+        return child;
+      }
+      remove() { this.parentNode?.removeChild(this); }
+      replaceChildren(...nodes) {
+        for (const c of [...this.childNodes]) this.removeChild(c);
+        for (const n of nodes) this.appendChild(n);
+      }
+      replaceWith(replacement) {
+        if (!this.parentNode) return;
+        const idx = this.parentNode.childNodes.indexOf(this);
+        if (idx < 0) return;
+        replacement.parentNode?.removeChild(replacement);
+        replacement.parentNode = this.parentNode;
+        this.parentNode.childNodes[idx] = replacement;
+        this.parentNode = null;
+      }
+      contains(target) {
+        let cur = target;
+        while (cur) {
+          if (cur === this) return true;
+          cur = cur.parentNode;
+        }
+        return false;
+      }
+      get nodeValue() { return this.nodeType === 3 ? this._text : null; }
+      set nodeValue(v) { this._text = String(v || ""); }
+      get textContent() {
+        if (this.nodeType === 3) return this._text;
+        return this.childNodes.map((c) => c.textContent).join("");
+      }
+      set textContent(v) {
+        for (const c of [...this.childNodes]) this.removeChild(c);
+        const t = new MiniNode(3);
+        t._text = String(v || "");
+        this.appendChild(t);
+      }
+      cloneNode(deep = false) {
+        const copy = new MiniNode(this.nodeType, this.localName);
+        copy._text = this._text;
+        copy.ownerDocument = this.ownerDocument;
+        for (const [k, v] of this._attrs.entries()) copy._attrs.set(k, v);
+        if (deep) {
+          for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
+        }
+        return copy;
+      }
+      matches(selector) {
+        return selector.split(",").map((s) => s.trim()).some((part) => {
+          if (!part) return false;
+          if (/^[a-z0-9]+$/i.test(part)) return this.localName === part.toLowerCase();
+          if (part.startsWith(".")) return String(this.getAttribute("class") || "").split(/\s+/).includes(part.slice(1));
+          if (part.startsWith("#")) return this.getAttribute("id") === part.slice(1);
+          return false;
+        });
+      }
+      closest(selector) {
+        let cur = this;
+        while (cur && cur.nodeType === 1) {
+          if (cur.matches(selector)) return cur;
+          cur = cur.parentElement;
+        }
+        return null;
+      }
+      querySelectorAll(selector) {
+        const result = [];
+        const walk = (node) => {
+          for (const child of node.children) {
+            if (child.matches(selector)) result.push(child);
+            walk(child);
+          }
+        };
+        walk(this);
+        return result;
+      }
+      querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+      compareDocumentPosition(other) {
+        const all = [];
+        const rootNode = this.ownerDocument?.documentElement || this;
+        const collect = (n) => {
+          all.push(n);
+          for (const c of n.childNodes) collect(c);
+        };
+        collect(rootNode);
+        return all.indexOf(this) < all.indexOf(other) ? 4 : 2;
+      }
+      get outerHTML() {
+        if (this.nodeType === 3) return this._text;
+        const attrs = Array.from(this._attrs.entries()).map(([k, v]) => ` ${k}="${v}"`).join("");
+        if (this.localName === "img") return `<img${attrs}>`;
+        return `<${this.localName}${attrs}>${this.childNodes.map((c) => c.outerHTML).join("")}</${this.localName}>`;
+      }
+    }
+
+    function buildMiniDocFromHtml(html) {
+      const doc = {
+        nodeType: 9,
+        documentElement: new MiniNode(1, "html"),
+        body: new MiniNode(1, "body"),
+        createElement(tag) {
+          const n = new MiniNode(1, tag);
+          n.ownerDocument = doc;
+          return n;
+        },
+        createTextNode(text) {
+          const n = new MiniNode(3);
+          n._text = String(text || "");
+          n.ownerDocument = doc;
+          return n;
+        },
+        createDocumentFragment() {
+          const f = new MiniNode(11);
+          f.ownerDocument = doc;
+          return f;
+        },
+        querySelector(sel) { return doc.documentElement.querySelector(sel); },
+        querySelectorAll(sel) { return doc.documentElement.querySelectorAll(sel); },
+      };
+      doc.documentElement.ownerDocument = doc;
+      doc.body.ownerDocument = doc;
+      doc.documentElement.appendChild(doc.body);
+      if (html.includes("<nav>")) {
+        const nav = doc.createElement("nav");
+        nav.textContent = "Site Navigation";
+        doc.body.appendChild(nav);
+      }
+      const article = doc.createElement("article");
+      const p = doc.createElement("p");
+      const pMatch = html.match(/<p>([\s\S]*?)<\/p>/);
+      p.textContent = pMatch ? pMatch[1] : cfParagraphText;
+      article.appendChild(p);
+      const imgMatch = html.match(/<img\s+src="([^"]+)"/);
+      if (imgMatch) {
+        const img = doc.createElement("img");
+        img.setAttribute("src", imgMatch[1]);
+        article.appendChild(img);
+      }
+      if (html.includes("<h2>References</h2>")) {
+        const h2 = doc.createElement("h2");
+        h2.textContent = "References";
+        const refP = doc.createElement("p");
+        refP.textContent = "Reference list item 1";
+        article.appendChild(h2);
+        article.appendChild(refP);
+      }
+      doc.body.appendChild(article);
+      return doc;
+    }
+
+    const renderedArticleHTML = `<html><body><nav>Site Navigation</nav><article><p>${cfParagraphText}</p><img src="${cfImageURL}"><h2>References</h2><p>Reference list item 1</p></article></body></html>`;
+    const trChallengeCtx = {
+      URL,
+      Date,
+      Math,
+      Uint8Array,
+      ArrayBuffer,
+      TextEncoder,
+      TextDecoder,
+      AbortController,
+      atob,
+      btoa,
+      setTimeout,
+      clearTimeout,
+      DOMParser: class {
+        parseFromString(html) { return buildMiniDocFromHtml(html); }
+      },
+      OS: { File: { makeDir: async () => {} } },
+      Zotero: {
+        Prefs: { get: () => null, set: () => {} },
+        debug: () => {},
+        getMainWindow: () => ({ openDialog: () => ({ focus: () => {}, close: () => {} }) }),
+        HTTP: {
+          request: async (_method, reqURL, opts) => {
+            if (reqURL === cfArticleURL && opts?.anon === true) {
+              const err = new Error("HTTP 403");
+              err.status = 403;
+              err.xmlhttp = {
+                status: 403,
+                responseText: "<title>Just a moment...</title>",
+                getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "",
+              };
+              throw err;
+            }
+            if (reqURL === cfImageURL && opts?.anon === true) {
+              return { status: 403, getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "" };
+            }
+            throw new Error(`Unexpected direct HTTP request: ${reqURL} (anon=${opts?.anon})`);
+          },
+        },
+      },
+      AutoFullTextSupportingInfo: {
+        isChallengeHTML: siMod.isChallengeHTML,
+        isChallengeDocument: siMod.isChallengeDocument,
+        getBrowserUserAgent: () => "Mozilla/5.0 Firefox/140.0",
+        openChallengeSession: async (challengeURL, options) => {
+          openChallengeCalls.push({ challengeURL, mode: options.mode, extractLabel: options.extractLabel });
+          assert.equal(options.mode, "translation", "translation challenge must open in translation mode");
+          assert.equal(options.extractLabel, "已通过，立即提取正文");
+          const fakeHandle = {
+            signal: options.signal,
+            setStatus: (s) => progressStages.push(s),
+            fetchInWindow: async (url, _ref, _max, accept) => {
+              inWindowImageFetches += 1;
+              assert.equal(url, cfImageURL);
+              assert.match(accept, /image\//);
+              return {
+                status: 200,
+                responseURL: cfImageURL,
+                bytes: pngBytes,
+                getHeader: (h) => h.toLowerCase() === "content-type" ? "image/png" : "",
+              };
+            },
+          };
+          return options.onVerified({
+            doc: null,
+            responseURL: cfArticleURL,
+            html: renderedArticleHTML,
+            source: "pagedata-actor",
+            handle: fakeHandle,
+          });
+        },
+      },
+      AutoFullTextTranslator: {
+        getActiveProvider: () => ({ name: "TestProvider", model: "test-model" }),
+        getSystemPrompt: () => "Translate to Simplified Chinese.",
+        translate: async () => cfParagraphZh,
+      },
+      AutoFullTextPdf: {
+        createWorkspace: async () => ({
+          path: "/tmp/test-tr-cf",
+          file: (name) => `/tmp/test-tr-cf/${name}`,
+          writeText: async (name, content) => { writtenFiles.set(name, content); },
+          cleanup: async () => { workspaceCleaned = true; },
+        }),
+        makeWebsitePdfPage: (html) => `<!doctype html><html><body>${html}</body></html>`,
+        printHtmlToPdf: async (html) => { printedHtml = html; },
+        attachPdf: async (_id, _path, title) => { attachedTitle = title; },
+      },
+    };
+    vm.createContext(trChallengeCtx);
+    vm.runInContext(read("content/modules/core.js"), trChallengeCtx);
+    vm.runInContext(read("content/modules/fulltext-translation.js"), trChallengeCtx);
+
+    const trResult = await trChallengeCtx.AutoFullTextTranslation.create(
+      { id: 88, key: "CFTR88", getField: (f) => f === "url" ? cfArticleURL : "" },
+      null,
+      { onProgress: ({ stage }) => { if (stage) progressStages.push(stage); } },
+    );
+    assert.equal(openChallengeCalls.length, 1, "Cloudflare 403 during translation must open challenge session");
+    assert.equal(trResult.usedChallengeWindow, true);
+    assert.equal(inWindowImageFetches, 1, "Cloudflare-protected image must fall back to verified challenge window fetch");
+    assert.ok(writtenFiles.get("article-page-original.html")?.includes("Site Navigation"), "raw original HTML must be persisted before cleaning");
+    assert.doesNotMatch(writtenFiles.get("article-page-cleaned.html") || "", /Site Navigation|References/, "non-body nav and References must be stripped");
+    assert.match(writtenFiles.get("article-page-assets-inlined.html") || "", /data:image\/png;base64,/, "CF-protected image must be inlined as base64 data URI");
+    assert.match(printedHtml, /表层缺陷钝化显著抑制了钙钛矿太阳能电池中的非辐射复合/, "final PDF HTML must contain Chinese translation");
+    assert.equal(attachedTitle, "全文翻译", "translated PDF must be imported as 全文翻译 attachment");
+    assert.equal(workspaceCleaned, true, "temp workspace must be cleaned after successful import");
+
+    // Verify cancellation inside translation challenge window cleans up workspace and propagates FullTextChallengeCancelledError
+    workspaceCleaned = false;
+    trChallengeCtx.AutoFullTextSupportingInfo.openChallengeSession = async () => {
+      throw Object.assign(new Error("已取消安全验证，全文翻译已停止。"), { name: "FullTextChallengeCancelledError" });
+    };
+    await assert.rejects(
+      trChallengeCtx.AutoFullTextTranslation.create({ id: 89, key: "CFTR89", getField: (f) => f === "url" ? cfArticleURL : "" }),
+      (err) => err?.name === "FullTextChallengeCancelledError",
+    );
+    assert.equal(workspaceCleaned, true, "cancelling translation challenge window must clean up temp workspace");
+  }
 }
 
 let releaseDelay;
@@ -2121,13 +2598,16 @@ assert.match(manualAlerts.at(-1), /完成 1 项/);
   releaseManualSI({ skipped: false });
   await flushManual();
 
-  // Verify floating progress panel for Full-Text Translation + live progress updates + Cancel button + concurrent stacking with SI
+  // Verify floating progress panel for Full-Text Translation + live progress updates + Challenge Focus button + Cancel button + concurrent stacking with SI
   const prevCreate = manualContext.AutoFullTextTranslation.create;
   let translationCancelObserved = false;
   let translationCalls = 0;
+  let challengeFocusCount = 0;
+  const fakeChallengeWin = { focus: () => { challengeFocusCount += 1; } };
   manualContext.AutoFullTextTranslation.create = async (item, signal, opts) => {
     translationCalls += 1;
     translatedItems.push(item.id);
+    opts?.onProgress?.({ stage: "等待出版商安全验证（自动跳过或手动完成）…", percent: 14, challengeWindow: fakeChallengeWin });
     opts?.onProgress?.({ stage: "正在翻译正文（已完成 3/10 片，共 5 段）…", percent: 50 });
     return new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => {
@@ -2140,15 +2620,19 @@ assert.match(manualAlerts.at(-1), /完成 1 项/);
   await flushManual();
   const trStageNode = panelNodes.get("zotero-auto-fulltext-translation-stage");
   const trBarNode = panelNodes.get("zotero-auto-fulltext-translation-bar");
+  const trFocusBtn = panelNodes.get("zotero-auto-fulltext-translation-focus-btn");
   const trCancelBtn = panelNodes.get("zotero-auto-fulltext-translation-cancel-btn");
   assert.ok(trStageNode, "floating translation progress panel must appear immediately on click");
   assert.match(trStageNode.textContent, /正在翻译正文（已完成 3\/10 片，共 5 段）/);
   assert.equal(trBarNode?.style?.width, "50%");
+  assert.ok(trFocusBtn, "translation progress panel must render a focus-challenge button");
+  assert.equal(trFocusBtn.style.display, "inline-block", "focus-challenge button must appear while translation challenge window is open");
   assert.ok(trCancelBtn, "floating translation progress panel must render a cancel button");
 
-  // Clicking Generate Full-Text Translation again while running must report live stage and cancel hint
+  // Clicking Generate Full-Text Translation again while running must focus challenge window and report live stage + cancel hint
   manualMenu.menus[1].onCommand(null, singleSelection);
   await flushManual();
+  assert.equal(challengeFocusCount, 1, "re-clicking Generate Full-Text Translation while challenge window is open must focus it");
   assert.match(manualAlerts.at(-1), /正在翻译正文（已完成 3\/10 片，共 5 段）[\s\S]*取消翻译/);
 
   // Starting SI concurrently must stack both cards inside #zotero-auto-fulltext-progress-stack without removing translation card
@@ -2163,6 +2647,14 @@ assert.match(manualAlerts.at(-1), /完成 1 项/);
   trCancelBtn.click();
   await flushManual();
   assert.equal(translationCancelObserved, true, "clicking cancel translation button must abort in-flight translation");
+  assert.match(manualAlerts.at(-1), /补处理已取消/);
+
+  // Cancelling translation challenge window must treat as cancelled and release lock immediately
+  manualContext.AutoFullTextTranslation.create = async () => {
+    throw Object.assign(new Error("已取消安全验证，全文翻译已停止。"), { name: "FullTextChallengeCancelledError" });
+  };
+  manualMenu.menus[1].onCommand(null, singleSelection);
+  await flushManual();
   assert.match(manualAlerts.at(-1), /补处理已取消/);
 
   manualContext.AutoFullTextTranslation.create = prevCreate;

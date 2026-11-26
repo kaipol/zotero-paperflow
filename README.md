@@ -30,6 +30,8 @@
 
 **0.3.18 Zotero 10 PageData 跨进程页面采集与 RSC 深度链接提取：**修复 Zotero 10 质询窗口在 Cloudflare COOP 隔离或远程内容进程下 `browser.contentDocument` 为空导致状态栏一直停留在「正在加载出版商页面…」且无法自动提取 SI 的问题（接入 Zotero 内置 `PageData` JSWindowActor 与 `browsingContext.currentWindowGlobal.documentURI` 读取实时渲染后的页面 HTML，并在 `http-on-examine-response` 中同步跟踪主文档 403/200 状态）；同时扩展 RSC 等出版商的 SI 识别（兼容 `.list__item-link` 无扩展名 `datafile`/`getsupplementary` 链接、7 层深嵌套区块上下文、全子域 JSON 转义 `suppdata` 源码兜底、meta-refresh 跳转跟踪、`articlepdf/articlehtml` 回退 `articlelanding` 以及 `si-error.txt` 脱敏页面诊断信息）。
 
+**0.3.19 全文翻译 Cloudflare 质询自动跳过与人工验证：**生成中文「全文翻译」时，若读取文章网页遇到 HTTP 403 / Cloudflare 安全质询，现与 SI 共用独立安全验证窗口（全文翻译专用模式，按钮自动切换为「已通过，立即提取正文」），优先尝试自动跳过 Turnstile，若需人工点击则保留窗口等待完成；验证通过后自动采集已渲染文章页 HTML、去除导航/侧栏/参考文献等非正文内容、借助已验证会话补齐受保护的页面样式表与图片资源并自动关闭验证窗口，随后无缝执行逐段简体中文翻译、PDF 排版导出与 `全文翻译` 子附件导入。右下角全文翻译进度卡片同步支持「显示验证窗口」按钮，取消验证时自动清理临时工作区并立即释放任务锁。
+
 ## 功能与实现结构
 
 ```text
@@ -98,7 +100,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ## 安装与试用
 
-1. 用 7-Zip 将 `zotero-paperflow-0.3.17.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
+1. 用 7-Zip 将 `zotero-paperflow-0.3.19.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
 2. 在 Zotero 中选择 **工具 → 插件 → 齿轮 → Install Plugin From File…**，选取该 XPI，按提示重启 Zotero。
 3. 打开 **编辑 → 设置 → Zotero PaperFlow**，分别选择两个选项并保存。全文翻译需选择已配置的供应商、设置模型与密钥环境变量、保存或自定义系统提示词；SI 的非 PDF 转换需要 Windows 与可用的 Microsoft Office 组件。PowerPoint 的 PDF 导出可能显示 PowerPoint 窗口。
 4. 新增具有 DOI/网页 URL 的测试文献验证自动选项；已有文献可在文库中选中后右键，分别执行补抓 SI 或生成中文全文翻译。
@@ -111,7 +113,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ```bash
 node scripts/build-xpi.mjs
-node test/package-smoke.mjs ../zotero-paperflow-0.3.17.xpi
+node test/package-smoke.mjs ../zotero-paperflow-0.3.19.xpi
 ```
 
 ## 当前验证边界
