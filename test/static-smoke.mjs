@@ -28,7 +28,7 @@ assert.match(chromeManifest, /^content zotero-auto-fulltext content\/\s*$/);
 assert.doesNotMatch(chromeManifest, /\.\/content\//);
 
 const manifest = JSON.parse(read("manifest.json"));
-assert.equal(manifest.version, "0.3.19");
+assert.equal(manifest.version, "0.3.20");
 assert.equal(manifest.name, "Zotero PaperFlow");
 assert.equal(manifest.applications.zotero.strict_min_version, "10.0.8");
 assert.equal(manifest.applications.zotero.strict_max_version, "10.*");
@@ -105,6 +105,8 @@ assert.match(challengeWindowScript, /isTopLevelDocumentChannel/);
 assert.match(challengeWindowScript, /SupportingInfoChallengeCancelledError/);
 assert.match(challengeWindowScript, /FullTextChallengeCancelledError/);
 assert.match(challengeWindowScript, /hasArticleContent/);
+assert.match(challengeWindowScript, /navigateToArticle/);
+assert.match(challengeWindowScript, /TRANSLATION_HYDRATION_SETTLE_MS/);
 assert.match(challengeWindowScript, /已通过，立即提取正文/);
 
 const supportingInfo = read("content/modules/supporting-info.js");
@@ -170,6 +172,11 @@ assert.match(fullText, /async function create\(item, signal = null, \{ onProgres
 assert.match(fullText, /snapshotArticleViaChallenge/);
 assert.match(fullText, /FullTextChallengeCancelledError/);
 assert.match(fullText, /mode:\s*"translation"/);
+assert.match(fullText, /function visibleTextLength\(/);
+assert.match(fullText, /function findFullTextHTMLURL\(/);
+assert.match(fullText, /function unwrapFormElement\(/);
+assert.match(fullText, /function buildCleanedArticle\(/);
+assert.match(fullText, /translation-diagnostics\.txt/);
 assert.ok(fullText.indexOf("onRawText: (text) => workspace.writeText(\"article-page-original.html\", text)") < fullText.indexOf("const sourceRoot = chooseArticleRoot", fullText.indexOf("async function snapshotArticle")), "persist raw article response before parsing and cleaning");
 assert.ok(fullText.indexOf("article-page-original.html") < fullText.indexOf("await translateBlocks(root"), "save the raw page before translation starts");
 assert.ok(fullText.indexOf("article-page-cleaned.html") < fullText.indexOf("await translateBlocks(root"), "save cleaned article HTML before translation starts");

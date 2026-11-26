@@ -2090,6 +2090,25 @@ assert.equal(siWorkspaceCleaned, true);
       matches(selector) {
         return selector.split(",").map((s) => s.trim()).some((part) => {
           if (!part) return false;
+          if (part === "*") return this.nodeType === 1;
+          const attrContains = part.match(/^([a-z0-9]*)\[([a-z0-9_-]+)\*=\s*["']?([^"'\]]+?)["']?(?:\s+i)?\]$/i);
+          if (attrContains) {
+            const [, tag, attr, needle] = attrContains;
+            if (tag && this.localName !== tag.toLowerCase()) return false;
+            return String(this.getAttribute(attr) || "").toLowerCase().includes(needle.toLowerCase());
+          }
+          const attrEquals = part.match(/^([a-z0-9]*)\[([a-z0-9_-]+)=\s*["']?([^"'\]]+?)["']?(?:\s+i)?\]$/i);
+          if (attrEquals) {
+            const [, tag, attr, expected] = attrEquals;
+            if (tag && this.localName !== tag.toLowerCase()) return false;
+            return String(this.getAttribute(attr) || "").toLowerCase() === expected.toLowerCase();
+          }
+          const attrPresent = part.match(/^([a-z0-9]*)\[([a-z0-9_-]+)\]$/i);
+          if (attrPresent) {
+            const [, tag, attr] = attrPresent;
+            if (tag && this.localName !== tag.toLowerCase()) return false;
+            return this.getAttribute(attr) !== null;
+          }
           if (/^[a-z0-9]+$/i.test(part)) return this.localName === part.toLowerCase();
           if (part.startsWith(".")) return String(this.getAttribute("class") || "").split(/\s+/).includes(part.slice(1));
           if (part.startsWith("#")) return this.getAttribute("id") === part.slice(1);
@@ -2308,6 +2327,332 @@ assert.equal(siWorkspaceCleaned, true);
       (err) => err?.name === "FullTextChallengeCancelledError",
     );
     assert.equal(workspaceCleaned, true, "cancelling translation challenge window must clean up temp workspace");
+
+    // Scenario P: Regression tests for v0.3.20 — script-bloat skeleton rejection, RSC articlelanding -> articlehtml upgrade via handle.navigateToArticle, ASP.NET <form>/[class*=metrics] ancestor protection, early sidebar stop-heading protection, and actionable diagnostics
+    {
+      const rscLandingURL = "https://pubs.rsc.org/en/content/articlelanding/2026/ee/d6ee05315g";
+      const rscFullTextURL = "https://pubs.rsc.org/en/content/articlehtml/2026/ee/d6ee05315g";
+      const makeDoc = (title, buildBody) => {
+        const doc = {
+          nodeType: 9,
+          title,
+          documentElement: new MiniNode(1, "html"),
+          body: new MiniNode(1, "body"),
+          createElement(tag) {
+            const n = new MiniNode(1, tag);
+            n.ownerDocument = doc;
+            return n;
+          },
+          createTextNode(text) {
+            const n = new MiniNode(3);
+            n._text = String(text || "");
+            n.ownerDocument = doc;
+            return n;
+          },
+          createDocumentFragment() {
+            const f = new MiniNode(11);
+            f.ownerDocument = doc;
+            return f;
+          },
+          querySelector(sel) { return doc.documentElement.querySelector(sel); },
+          querySelectorAll(sel) { return doc.documentElement.querySelectorAll(sel); },
+        };
+        doc.documentElement.ownerDocument = doc;
+        doc.body.ownerDocument = doc;
+        doc.documentElement.appendChild(doc.body);
+        buildBody(doc);
+        return doc;
+      };
+
+      // 1. Script-bloated skeleton page must NOT pass hasUsableArticleBody
+      const skeletonDoc = makeDoc("Loading...", (doc) => {
+        const script = doc.createElement("script");
+        script.textContent = "window.__DATA__ = '" + "x".repeat(2500) + "';";
+        const p = doc.createElement("p");
+        p.textContent = "Loading article shell...";
+        doc.body.appendChild(script);
+        doc.body.appendChild(p);
+      });
+      assert.equal(
+        trChallengeCtx.AutoFullTextTranslation.hasUsableArticleBody(skeletonDoc, rscFullTextURL),
+        false,
+        "script-heavy skeleton page with short visible text must not trigger premature extraction",
+      );
+
+      // 2. RSC articlelanding with short abstract + Article HTML link passes handoff check and resolves findFullTextHTMLURL
+      const landingDoc = makeDoc("RSC Landing Page", (doc) => {
+        const p = doc.createElement("p");
+        p.textContent = "Perovskite solar cells achieve high efficiency through defect passivation and tailored crystal growth across operational lifetimes.".repeat(2);
+        const link = doc.createElement("a");
+        link.setAttribute("href", "/en/content/articlehtml/2026/ee/d6ee05315g");
+        link.textContent = "Article HTML";
+        doc.body.appendChild(p);
+        doc.body.appendChild(link);
+      });
+      assert.equal(
+        trChallengeCtx.AutoFullTextTranslation.findFullTextHTMLURL(landingDoc, rscLandingURL),
+        rscFullTextURL,
+        "RSC landing page should discover Article HTML full-text URL",
+      );
+      assert.equal(
+        trChallengeCtx.AutoFullTextTranslation.hasUsableArticleBody(landingDoc, rscLandingURL),
+        true,
+        "RSC landing page with Article HTML link should be ready for handoff and upgrade",
+      );
+
+      // 3. Full-text page wrapped inside <form id="aspnetForm"> + <div class="article-metrics-shell"> + early <h3>Supplementary information</h3> before body
+      const buildRSCFullTextDoc = () => makeDoc("RSC Full Text Article", (doc) => {
+        const form = doc.createElement("form");
+        form.setAttribute("id", "aspnetForm");
+        const metricsShell = doc.createElement("div");
+        metricsShell.setAttribute("class", "article-metrics-shell");
+        const tocHeading = doc.createElement("h3");
+        tocHeading.textContent = "Supplementary information";
+        const article = doc.createElement("article");
+        const h1 = doc.createElement("h1");
+        h1.textContent = "Interfacial Defect Passivation in Perovskite Solar Cells";
+        const p1 = doc.createElement("p");
+        p1.textContent = cfParagraphText;
+        const p2 = doc.createElement("p");
+        p2.textContent = cfParagraphText;
+        const refHeading = doc.createElement("h2");
+        refHeading.textContent = "References";
+        const refP = doc.createElement("p");
+        refP.textContent = "1. Reference entry that should be removed.";
+        article.appendChild(tocHeading);
+        article.appendChild(h1);
+        article.appendChild(p1);
+        article.appendChild(p2);
+        article.appendChild(refHeading);
+        article.appendChild(refP);
+        metricsShell.appendChild(article);
+        form.appendChild(metricsShell);
+        doc.body.appendChild(form);
+      });
+
+      const rscWritten = new Map();
+      let navigatedTargets = [];
+      let rscAttached = "";
+      let rscCleaned = false;
+      const rscCtx = {
+        URL,
+        Date,
+        Math,
+        Uint8Array,
+        ArrayBuffer,
+        TextEncoder,
+        TextDecoder,
+        AbortController,
+        atob,
+        btoa,
+        setTimeout,
+        clearTimeout,
+        DOMParser: class {
+          parseFromString(html) {
+            if (html.includes("MARKER_RSC_FULLTEXT")) return buildRSCFullTextDoc();
+            if (html.includes("MARKER_RSC_LANDING")) return landingDoc;
+            return buildMiniDocFromHtml(html);
+          }
+        },
+        OS: { File: { makeDir: async () => {} } },
+        Zotero: {
+          Prefs: { get: () => null, set: () => {} },
+          debug: () => {},
+          getMainWindow: () => ({ openDialog: () => ({ focus: () => {}, close: () => {} }) }),
+          HTTP: {
+            request: async () => {
+              const err = new Error("HTTP 403");
+              err.status = 403;
+              err.xmlhttp = { status: 403, getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "" };
+              throw err;
+            },
+          },
+        },
+        AutoFullTextSupportingInfo: {
+          isChallengeHTML: siMod.isChallengeHTML,
+          isChallengeDocument: siMod.isChallengeDocument,
+          getBrowserUserAgent: () => "Mozilla/5.0 Firefox/140.0",
+          openChallengeSession: async (_url, options) => {
+            const fakeHandle = {
+              signal: options.signal,
+              setStatus: () => {},
+              fetchInWindow: async () => ({ status: 403, responseURL: rscFullTextURL, bytes: new Uint8Array(), getHeader: () => "" }),
+              navigateToArticle: async (targetURL) => {
+                navigatedTargets.push(targetURL);
+                return {
+                  doc: null,
+                  responseURL: targetURL,
+                  html: "<html><body><!-- MARKER_RSC_FULLTEXT --></body></html>",
+                  source: "pagedata-actor",
+                };
+              },
+            };
+            return options.onVerified({
+              doc: null,
+              responseURL: rscLandingURL,
+              html: "<html><body><!-- MARKER_RSC_LANDING --></body></html>",
+              source: "pagedata-actor",
+              handle: fakeHandle,
+            });
+          },
+        },
+        AutoFullTextTranslator: {
+          getActiveProvider: () => ({ name: "TestProvider", model: "test-model" }),
+          getSystemPrompt: () => "Translate to Simplified Chinese.",
+          translate: async () => cfParagraphZh,
+        },
+        AutoFullTextPdf: {
+          createWorkspace: async () => ({
+            path: "/tmp/test-rsc-upgrade",
+            file: (name) => `/tmp/test-rsc-upgrade/${name}`,
+            writeText: async (name, content) => { rscWritten.set(name, content); },
+            cleanup: async () => { rscCleaned = true; },
+          }),
+          makeWebsitePdfPage: (html) => `<!doctype html><html><body>${html}</body></html>`,
+          printHtmlToPdf: async () => {},
+          attachPdf: async (_id, _path, title) => { rscAttached = title; },
+        },
+      };
+      vm.createContext(rscCtx);
+      vm.runInContext(read("content/modules/core.js"), rscCtx);
+      vm.runInContext(read("content/modules/fulltext-translation.js"), rscCtx);
+
+      const rscResult = await rscCtx.AutoFullTextTranslation.create({
+        id: 90,
+        key: "RSC90",
+        getField: (f) => f === "url" ? rscLandingURL : "",
+      });
+      assert.deepEqual(navigatedTargets, [rscFullTextURL], "must upgrade from RSC articlelanding to articlehtml via navigateToArticle when fetchInWindow returns 403");
+      assert.equal(rscResult.usedChallengeWindow, true);
+      assert.doesNotMatch(rscWritten.get("article-page-cleaned.html") || "", /<form\b/i, "outer ASP.NET <form> ancestor must be unwrapped to <div> rather than deleting the article or remaining as <form>");
+      assert.match(rscWritten.get("article-page-cleaned.html") || "", /Interfacial Defect Passivation/, "article body inside <form> + [class*=metrics] + after early Supplementary information heading must be preserved");
+      assert.doesNotMatch(rscWritten.get("article-page-cleaned.html") || "", /Reference entry that should be removed/, "trailing References section must still be stripped");
+      assert.equal(rscAttached, "全文翻译");
+      assert.equal(rscCleaned, true);
+
+      // 4. When article really is abstract-only / too short even after trying fullTextURL, report actionable diagnostics and save translation-diagnostics.txt
+      rscWritten.clear();
+      rscCtx.AutoFullTextSupportingInfo.openChallengeSession = async (_url, options) => {
+        const fakeHandle = {
+          signal: options.signal,
+          setStatus: () => {},
+          fetchInWindow: async () => ({ status: 403, responseURL: rscFullTextURL, bytes: new Uint8Array(), getHeader: () => "" }),
+          navigateToArticle: async () => null,
+        };
+        return options.onVerified({
+          doc: null,
+          responseURL: rscLandingURL,
+          html: "<html><body><!-- MARKER_RSC_LANDING --></body></html>",
+          source: "pagedata-actor",
+          handle: fakeHandle,
+        });
+      };
+      await assert.rejects(
+        rscCtx.AutoFullTextTranslation.create({ id: 91, key: "RSC91", getField: (f) => f === "url" ? rscLandingURL : "" }),
+        (err) => /The cleaned article body is too short to translate\./.test(err.message) &&
+          /当前页面：pubs\.rsc\.org\/en\/content\/articlelanding\/2026\/ee\/d6ee05315g/.test(err.message) &&
+          /可见正文字符数：清洗前/.test(err.message),
+      );
+      assert.match(rscWritten.get("translation-diagnostics.txt") || "", /已尝试跳转全文 HTML 页面/);
+
+      // 5. Real challenge-window.js handle.navigateToArticle(nextURL) transitions mode to translation-nav and resolves via PageData actor
+      let navResolved = null;
+      let currentNavURL = rscLandingURL;
+      const navBrowser = {
+        browsingContext: {
+          customUserAgent: "",
+          currentWindowGlobal: {
+            get documentURI() { return { spec: currentNavURL }; },
+            getActor(name) {
+              if (name !== "PageData") return null;
+              return {
+                sendQuery: async (msg) => {
+                  if (currentNavURL === rscFullTextURL) {
+                    if (msg === "title") return "Full Article HTML";
+                    if (msg === "documentHTML") return `<html><body><article><p>${cfParagraphText}</p></article></body></html>`;
+                    return "";
+                  }
+                  if (msg === "title") return "Landing Abstract";
+                  if (msg === "documentHTML") {
+                    return `<html><body><h1>Interfacial Defect Passivation in Perovskite Solar Cells</h1><p>Abstract summary for perovskite solar cells demonstrating suppressed nonradiative recombination and enhanced stability under continuous illumination.</p><a href="${rscFullTextURL}">Article HTML</a></body></html>`;
+                  }
+                  return "";
+                },
+              };
+            },
+          },
+        },
+        get currentURI() { return { spec: currentNavURL }; },
+        contentDocument: null,
+        contentWindow: null,
+        addEventListener: () => {},
+        addProgressListener: () => {},
+        removeProgressListener: () => {},
+        fixupAndLoadURIString: (u) => { currentNavURL = u; },
+        setAttribute: () => {},
+      };
+      const navNoopBtn = () => ({ textContent: "", addEventListener: () => {} });
+      let resolveNavDone;
+      let rejectNavDone;
+      const navDone = new Promise((resolve, reject) => {
+        resolveNavDone = resolve;
+        rejectNavDone = reject;
+      });
+      const navSession = {
+        url: rscLandingURL,
+        mode: "translation",
+        userAgent: "Mozilla/5.0 Firefox/140.0",
+        hasArticleContentHTML: (html, curURL) => {
+          if (curURL === rscLandingURL) return html.includes("Article HTML");
+          return html.length > 500;
+        },
+        onVerified: async ({ handle }) => {
+          navResolved = await handle.navigateToArticle(rscFullTextURL);
+          return { ok: true };
+        },
+        resolve: (res) => resolveNavDone(res),
+        reject: (err) => rejectNavDone(err),
+      };
+      const navContext = {
+        window: {
+          location: { href: "chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid=tr-nav" },
+          arguments: [{ wrappedJSObject: navSession }],
+          addEventListener: () => {},
+          close: () => {},
+        },
+        document: {
+          title: "",
+          readyState: "complete",
+          getElementById: (id) => ({
+            "si-challenge-status": { textContent: "" },
+            "si-challenge-url": { textContent: "" },
+            "si-challenge-reload": navNoopBtn(),
+            "si-challenge-extract": navNoopBtn(),
+            "si-challenge-cancel": navNoopBtn(),
+            "si-challenge-browser": navBrowser,
+          })[id] || null,
+        },
+        Services: mockServices,
+        Components: { interfaces: { nsIWebProgressListener: { STATE_STOP: 0x10 }, nsIHttpChannel: null } },
+        URL,
+        Uint8Array,
+        AbortController,
+        setInterval,
+        clearInterval,
+        setTimeout,
+        clearTimeout,
+        Date,
+      };
+      vm.createContext(navContext);
+      vm.runInContext(read("content/challenge-window.js"), navContext);
+      await Promise.race([
+        navDone,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("navigateToArticle test timed out")), 3000)),
+      ]);
+      assert.ok(navResolved, "challenge-window handle.navigateToArticle must resolve with navigated article page data");
+      assert.equal(navResolved.responseURL, rscFullTextURL);
+      assert.ok(navResolved.html.includes("Interfacial defect passivation"));
+    }
   }
 }
 

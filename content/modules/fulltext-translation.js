@@ -84,20 +84,211 @@ var AutoFullTextTranslation = (function () {
     return controller.signal;
   }
 
+  const IGNORED_TEXT_TAGS = new Set(["script", "style", "noscript", "template", "svg"]);
+  const ARTICLE_ROOT_SELECTOR = [
+    "article",
+    "[role=main]",
+    "main",
+    ".article-body",
+    ".article__body",
+    ".article-body-content",
+    ".article-content",
+    ".article__content",
+    ".article_content",
+    ".c-article-body",
+    ".hlFld-Fulltext",
+    ".article-section__content",
+    ".fulltext",
+    ".full-text",
+    "#article-body",
+    "#article-content",
+    "#fulltext",
+    "#pnlArticleContent",
+    "#maincontent",
+    "#body",
+  ].join(",");
+
+  function visibleTextLength(node) {
+    if (!node) return 0;
+    let total = 0;
+    const visit = (current) => {
+      if (!current) return;
+      if (current.nodeType === 3) {
+        total += String(current.nodeValue || "").replace(/\s+/g, " ").trim().length;
+        return;
+      }
+      if (current.nodeType !== 1) return;
+      const tag = String(current.localName || current.tagName || "").toLowerCase();
+      if (IGNORED_TEXT_TAGS.has(tag)) return;
+      const children = current.childNodes;
+      if (children && typeof children.length === "number") {
+        for (let i = 0; i < children.length; i += 1) visit(children[i]);
+      } else {
+        total += textLength(current);
+      }
+    };
+    visit(node);
+    return total;
+  }
+
+  function isDedicatedArticleContainer(element) {
+    if (!element || element.nodeType !== 1) return false;
+    const tag = String(element.localName || element.tagName || "").toLowerCase();
+    if (tag === "article") return true;
+    if (tag === "main") return false;
+    const role = String(element.getAttribute?.("role") || "").toLowerCase();
+    if (role === "main") return false;
+    const idAndClass = `${element.getAttribute?.("id") || ""} ${element.getAttribute?.("class") || ""}`.toLowerCase();
+    return /(?:article[-_]?body|article[-_]?content|c-article-body|hlfld-fulltext|full[-_]?text|pnlarticlecontent|article-section__content)/.test(idAndClass);
+  }
+
   function chooseArticleRoot(doc) {
-    const candidates = Array.from(doc.querySelectorAll(
-      "article,[role=main],main,.article-body,.article__body,.article-body-content,#article-body,#body",
-    )).filter((element) => textLength(element) > 500);
-    return candidates.reduce((best, candidate) =>
-      !best || textLength(candidate) > textLength(best) ? candidate : best,
-    null) || doc.body;
+    const candidates = Array.from(doc.querySelectorAll(ARTICLE_ROOT_SELECTOR))
+      .map((element) => ({ element, length: visibleTextLength(element) }))
+      .filter((entry) => entry.length > 500);
+    if (!candidates.length) return doc.body;
+    const longest = candidates.reduce((best, entry) => (!best || entry.length > best.length ? entry : best), null);
+    const dedicated = candidates
+      .filter((entry) => isDedicatedArticleContainer(entry.element))
+      .reduce((best, entry) => (!best || entry.length > best.length ? entry : best), null);
+    if (dedicated && longest && dedicated.length >= longest.length * 0.55) {
+      return dedicated.element;
+    }
+    return longest?.element || doc.body;
+  }
+
+  function isLandingOrAbstractURL(url) {
+    try {
+      const path = new URL(String(url || "")).pathname.toLowerCase();
+      return /\/(?:articlelanding|articlepdf|doi\/abs|doi\/epdf|abstract)\b/.test(path);
+    } catch {
+      return false;
+    }
+  }
+
+  function validateSamePublisherURL(candidate, baseURL) {
+    try {
+      const resolved = new URL(String(candidate || "").trim(), baseURL);
+      const checked = AutoFullText.validateArticleURL(resolved.href);
+      const baseHost = new URL(baseURL).hostname.toLowerCase();
+      const targetHost = new URL(checked).hostname.toLowerCase();
+      if (targetHost !== baseHost && !AutoFullText.isTrustedRemoteHost?.(targetHost)) return "";
+      const normCurrent = new URL(baseURL);
+      const normTarget = new URL(checked);
+      if (normTarget.origin === normCurrent.origin && normTarget.pathname === normCurrent.pathname && normTarget.search === normCurrent.search) {
+        return "";
+      }
+      return checked;
+    } catch {
+      return "";
+    }
+  }
+
+  function findFullTextHTMLURL(doc, currentURL) {
+    if (!doc || !currentURL) return "";
+    const isDisallowedTarget = (urlStr) => {
+      try {
+        const parsed = new URL(urlStr);
+        const path = parsed.pathname.toLowerCase();
+        if (/\.(?:pdf|zip|docx?|xlsx?|pptx?|eps|png|jpe?g|gif|svg)$/i.test(path)) return true;
+        if (/\/(?:articlepdf|doi\/(?:pdf|epdf)|pdf|login|signin|sign-in|subscribe|purchase|checkout|cart|auth|sso|shibboleth)\b/i.test(path)) return true;
+      } catch {
+        return true;
+      }
+      return false;
+    };
+
+    try {
+      const metaFullText = doc.querySelector?.('meta[name="citation_fulltext_html_url" i], meta[name="fulltext_html_url" i]');
+      const metaContent = metaFullText?.getAttribute?.("content") || "";
+      if (metaContent) {
+        const valid = validateSamePublisherURL(metaContent, currentURL);
+        if (valid && !isDisallowedTarget(valid)) return valid;
+      }
+    } catch {}
+
+    try {
+      const metaRefresh = doc.querySelector?.('meta[http-equiv="refresh" i]');
+      const refreshContent = String(metaRefresh?.getAttribute?.("content") || "");
+      const match = refreshContent.match(/url\s*=\s*['"]?([^'";\s]+)/i);
+      if (match?.[1]) {
+        const valid = validateSamePublisherURL(match[1], currentURL);
+        if (valid && !isDisallowedTarget(valid)) return valid;
+      }
+    } catch {}
+
+    try {
+      const anchors = Array.from(doc.querySelectorAll?.("a[href]") || []);
+      let bestLink = "";
+      let bestScore = 0;
+      for (const anchor of anchors) {
+        const href = String(anchor.getAttribute?.("href") || "").trim();
+        if (!href || href.startsWith("#") || /^javascript:/i.test(href)) continue;
+        const valid = validateSamePublisherURL(href, currentURL);
+        if (!valid || isDisallowedTarget(valid)) continue;
+        const lowerPath = (() => { try { return new URL(valid).pathname.toLowerCase(); } catch { return ""; } })();
+        const label = `${anchor.textContent || ""} ${anchor.getAttribute?.("title") || ""} ${anchor.getAttribute?.("aria-label") || ""}`
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        let score = 0;
+        if (/\/content\/articlehtml\//i.test(lowerPath)) score += 100;
+        else if (/\/doi\/full\//i.test(lowerPath)) score += 95;
+        else if (/\/full(?:text|-text)?(?:\b|\/)/i.test(lowerPath)) score += 70;
+        if (/^(?:article\s*html|full\s*text(?:\s*html)?|html\s*full\s*text|read\s*(?:the\s*)?full\s*(?:article|text)|view\s*full\s*text|read\s*article)$/.test(label)) {
+          score += 80;
+        } else if (/\b(?:article\s*html|full\s*text\s*html|view\s*full\s*article)\b/.test(label)) {
+          score += 55;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestLink = valid;
+        }
+      }
+      if (bestLink && bestScore >= 70) return bestLink;
+    } catch {}
+
+    try {
+      const parsed = new URL(currentURL);
+      const host = parsed.hostname.toLowerCase();
+      if (host === "pubs.rsc.org" && /\/content\/article(?:landing|pdf)\//i.test(parsed.pathname)) {
+        const upgraded = new URL(parsed.href);
+        upgraded.pathname = parsed.pathname.replace(/\/content\/article(?:landing|pdf)\//i, "/content/articlehtml/");
+        const valid = validateSamePublisherURL(upgraded.href, currentURL);
+        if (valid) return valid;
+      }
+      if (/\/doi\/abs\//i.test(parsed.pathname)) {
+        const upgraded = new URL(parsed.href);
+        upgraded.pathname = parsed.pathname.replace(/\/doi\/abs\//i, "/doi/full/");
+        const valid = validateSamePublisherURL(upgraded.href, currentURL);
+        if (valid) return valid;
+      }
+    } catch {}
+
+    return "";
+  }
+
+  function estimateCleanedBodyLength(doc, currentURL = "") {
+    if (!doc || !doc.body) return 0;
+    try {
+      const sourceRoot = chooseArticleRoot(doc);
+      if (!sourceRoot) return 0;
+      const cloned = sourceRoot.cloneNode(true);
+      removeUnwantedContent(cloned, currentURL || "https://example.invalid/", cloned);
+      return visibleTextLength(cloned);
+    } catch {
+      return visibleTextLength(doc.body);
+    }
   }
 
   function hasUsableArticleBody(doc, currentURL = "") {
     if (!doc || !doc.body) return false;
     if (currentURL && isChallengeDocument(doc, currentURL)) return false;
-    const root = chooseArticleRoot(doc);
-    return Boolean(root && textLength(root) >= 500);
+    if (estimateCleanedBodyLength(doc, currentURL) >= 500) return true;
+    if (currentURL && isLandingOrAbstractURL(currentURL) && findFullTextHTMLURL(doc, currentURL) && visibleTextLength(doc.body) >= 180) {
+      return true;
+    }
+    return false;
   }
 
   function hasUsableArticleHTML(html, currentURL = "") {
@@ -111,6 +302,10 @@ var AutoFullTextTranslation = (function () {
     } catch {}
     return raw.replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+      .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+      .replace(/<header[\s\S]*?<\/header>/gi, " ")
+      .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
       .trim().length >= 500;
@@ -136,6 +331,7 @@ var AutoFullTextTranslation = (function () {
 
   function removeAfter(element, root) {
     let current = element;
+    let removeCurrent = true;
     while (current && current !== root) {
       let sibling = current.nextSibling;
       while (sibling) {
@@ -144,26 +340,69 @@ var AutoFullTextTranslation = (function () {
         sibling = next;
       }
       const parent = current.parentElement;
-      current.remove();
+      if (removeCurrent) {
+        current.remove();
+        removeCurrent = false;
+      }
       current = parent;
     }
   }
 
-  function cleanSectionTail(root) {
+  function visibleTextBefore(root, targetNode) {
+    if (!root || !targetNode) return 0;
+    let total = 0;
+    let reached = false;
+    const visit = (node) => {
+      if (reached || !node) return;
+      if (node === targetNode) {
+        reached = true;
+        return;
+      }
+      if (node.nodeType === 3) {
+        total += String(node.nodeValue || "").replace(/\s+/g, " ").trim().length;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const tag = String(node.localName || node.tagName || "").toLowerCase();
+      if (IGNORED_TEXT_TAGS.has(tag)) return;
+      const children = node.childNodes;
+      if (children && typeof children.length === "number") {
+        for (let i = 0; i < children.length; i += 1) {
+          visit(children[i]);
+          if (reached) return;
+        }
+      }
+    };
+    visit(root);
+    return total;
+  }
+
+  function cleanSectionTail(root, contentNode = root) {
     const headings = Array.from(root.querySelectorAll("h1,h2,h3,h4,h5,h6"));
-    const acknowledgementHeading = headings.find((heading) => isAcknowledgementHeading(heading.textContent || ""));
+    const acknowledgementHeading = headings.find((heading) =>
+      isAcknowledgementHeading(heading.textContent || "") && visibleTextBefore(root, heading) >= 400,
+    );
     if (acknowledgementHeading) {
       const level = headingLevel(acknowledgementHeading);
       const nextSection = headings.find((heading) =>
         (acknowledgementHeading.compareDocumentPosition(heading) & 4) !== 0 && headingLevel(heading) <= level,
       );
-      if (nextSection) removeAfter(nextSection, root);
+      if (nextSection && visibleTextBefore(root, nextSection) >= 400) removeAfter(nextSection, root);
     }
     for (const heading of headings) {
       if (!root.contains(heading) || !isStopHeading(heading.textContent || "")) continue;
       const section = heading.closest("section");
-      if (section && section !== root) section.remove();
-      else removeAfter(heading, root);
+      const sectionWrapsBody = Boolean(
+        section && (section === root || (contentNode && (section === contentNode || section.contains(contentNode)))),
+      );
+      if (section && !sectionWrapsBody) {
+        const remaining = visibleTextLength(root) - visibleTextLength(section);
+        if (remaining >= 400 || visibleTextLength(section) < 1200) {
+          section.remove();
+        }
+      } else if (visibleTextBefore(root, heading) >= 400) {
+        removeAfter(heading, root);
+      }
     }
   }
 
@@ -193,10 +432,33 @@ var AutoFullTextTranslation = (function () {
     }
   }
 
-  function removeUnwantedContent(root, baseURL) {
-    const selectors = [
-      "script", "style", "noscript", "iframe", "object", "embed", "applet", "nav", "aside", "base", "link", "meta[http-equiv]",
-      "header[role=banner]", "footer[role=contentinfo]", ".site-header", ".site-footer",
+  function unwrapFormElement(formElement) {
+    const doc = formElement?.ownerDocument;
+    if (!doc || !formElement.parentNode) return;
+    const wrapper = doc.createElement("div");
+    for (const attr of Array.from(formElement.attributes || [])) {
+      const name = String(attr.name || "").toLowerCase();
+      if (["class", "id", "lang", "dir", "style"].includes(name)) {
+        wrapper.setAttribute(name, name === "style" ? sanitizeCSS(attr.value) : attr.value);
+      }
+    }
+    while (formElement.childNodes?.length) {
+      wrapper.appendChild(formElement.childNodes[0]);
+    }
+    formElement.replaceWith(wrapper);
+  }
+
+  function removeUnwantedContent(root, baseURL, contentNode = null) {
+    const dangerousSelectors = [
+      "script", "style", "noscript", "iframe", "object", "embed", "applet", "base", "link", "meta[http-equiv]",
+    ].join(",");
+    for (const element of Array.from(root.querySelectorAll(dangerousSelectors))) element.remove();
+
+    const baseContent = contentNode && root.contains(contentNode) ? contentNode : root;
+    const initialBodyVisible = visibleTextLength(baseContent);
+
+    const noiseSelectors = [
+      "nav", "aside", "header[role=banner]", "footer[role=contentinfo]", ".site-header", ".site-footer",
       ".page-header", ".page-footer", ".global-header", ".global-footer",
       "button", "form", "input", "select", "textarea", "dialog", "[role=navigation]",
       "[role=complementary]", "[aria-label*=advert i]", "[class*=advert i]", "[id*=advert i]",
@@ -205,8 +467,29 @@ var AutoFullTextTranslation = (function () {
       "[class*=contrib-group i]", "[class*=article-authors i]", "[class*=breadcrumb i]",
       "[class*=toolbar i]", "[class*=metrics i]", "[class*=citation i]",
     ].join(",");
-    for (const element of Array.from(root.querySelectorAll(selectors))) element.remove();
-    cleanSectionTail(root);
+    for (const element of Array.from(root.querySelectorAll(noiseSelectors))) {
+      if (!root.contains(element) || element === root) continue;
+      const tag = String(element.localName || element.tagName || "").toLowerCase();
+      const wrapsArticle = Boolean(baseContent && (element === baseContent || element.contains(baseContent)));
+      if (wrapsArticle) {
+        if (tag === "form") unwrapFormElement(element);
+        continue;
+      }
+      if (!["button", "input", "select", "textarea", "dialog"].includes(tag) && initialBodyVisible >= 400) {
+        const elementVisible = visibleTextLength(element);
+        const paragraphCount = element.querySelectorAll?.("p")?.length || 0;
+        if (
+          elementVisible >= 400 &&
+          elementVisible >= initialBodyVisible * 0.55 &&
+          (tag === "form" || paragraphCount >= 2 || elementVisible >= initialBodyVisible * 0.75)
+        ) {
+          if (tag === "form") unwrapFormElement(element);
+          continue;
+        }
+      }
+      element.remove();
+    }
+    cleanSectionTail(root, baseContent);
     sanitizeInlineSVG(root);
     for (const element of [root, ...Array.from(root.querySelectorAll("*"))]) {
       const tag = element.localName.toLowerCase();
@@ -961,7 +1244,7 @@ var AutoFullTextTranslation = (function () {
     }
   }
 
-  function wrapWithAncestors(sourceRoot, doc) {
+  function wrapWithAncestorsWithRef(sourceRoot, doc) {
     let content;
     if (sourceRoot === doc.body) {
       content = doc.createElement("div");
@@ -969,14 +1252,31 @@ var AutoFullTextTranslation = (function () {
     } else {
       content = sourceRoot.cloneNode(true);
     }
+    const contentNode = content;
     let ancestor = sourceRoot === doc.body ? null : sourceRoot.parentElement;
     while (ancestor && ancestor !== doc.body && ancestor !== doc.documentElement) {
-      const wrapper = ancestor.cloneNode(false);
+      const tag = String(ancestor.localName || ancestor.tagName || "").toLowerCase();
+      let wrapper;
+      if (tag === "form") {
+        wrapper = doc.createElement("div");
+        for (const attr of Array.from(ancestor.attributes || [])) {
+          const name = String(attr.name || "").toLowerCase();
+          if (["class", "id", "lang", "dir", "style"].includes(name)) {
+            wrapper.setAttribute(name, name === "style" ? sanitizeCSS(attr.value) : attr.value);
+          }
+        }
+      } else {
+        wrapper = ancestor.cloneNode(false);
+      }
       wrapper.appendChild(content);
       content = wrapper;
       ancestor = ancestor.parentElement;
     }
-    return content;
+    return { root: content, contentNode };
+  }
+
+  function wrapWithAncestors(sourceRoot, doc) {
+    return wrapWithAncestorsWithRef(sourceRoot, doc).root;
   }
 
   async function capturePageStyles(doc, baseURL, signal, challengeAuth = null) {
@@ -1068,6 +1368,112 @@ var AutoFullTextTranslation = (function () {
     return { styles, bodyAttributes };
   }
 
+  function formatTooShortError(activeURL, doc, rawVisibleLen, cleanedLen, triedFullTextURL = "") {
+    let pathSummary = "";
+    try {
+      const parsed = new URL(String(activeURL || ""));
+      pathSummary = `${parsed.hostname}${parsed.pathname}`;
+    } catch {}
+    const title = String(doc?.title || "").trim().slice(0, 100);
+    const parts = ["The cleaned article body is too short to translate."];
+    if (pathSummary) parts.push(`当前页面：${pathSummary}`);
+    if (title) parts.push(`页面标题：${title}`);
+    parts.push(`可见正文字符数：清洗前 ${rawVisibleLen} / 清洗后 ${cleanedLen}`);
+    if (triedFullTextURL) parts.push("已尝试跳转全文 HTML 页面，但未获取到足够正文（该文献可能需要机构订阅权限或仅提供 PDF/摘要）。");
+    else parts.push("该网页可能仅展示摘要、需要机构登录，或正文尚未加载完成。");
+    return parts.join("\n");
+  }
+
+  function buildCleanedArticle(parsedDoc, activeURL, liveDoc = null, preselectedRoot = null) {
+    const parsedRoot = preselectedRoot || chooseArticleRoot(parsedDoc);
+    const rawVisibleLen = visibleTextLength(parsedRoot);
+    const { root, contentNode } = wrapWithAncestorsWithRef(parsedRoot, parsedDoc);
+    let canvasCaptured = false;
+    if (liveDoc && liveDoc !== parsedDoc) {
+      try {
+        const liveRoot = chooseArticleRoot(liveDoc);
+        if (liveRoot) {
+          captureCanvas(liveRoot, root);
+          canvasCaptured = true;
+        }
+      } catch {
+        canvasCaptured = false;
+      }
+    }
+    if (!canvasCaptured) captureCanvas(parsedRoot, root);
+    normalizeMathMarkup(root);
+    removeUnwantedContent(root, activeURL, contentNode);
+    return {
+      root,
+      cleanedHTML: root.outerHTML,
+      rawVisibleLen,
+      cleanedLen: visibleTextLength(root),
+    };
+  }
+
+  async function fetchFullTextHTMLInChallenge(fullTextURL, referrerURL, handle, userAgent, signal) {
+    if (typeof handle?.fetchInWindow === "function") {
+      try {
+        const fetched = await handle.fetchInWindow(
+          fullTextURL,
+          referrerURL,
+          30 * 1024 * 1024,
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        );
+        if (fetched.status >= 200 && fetched.status < 300 && fetched.bytes?.length) {
+          const text = new TextDecoder("utf-8").decode(fetched.bytes);
+          if (text && !isChallengeHTML(text)) {
+            return { html: text, responseURL: fetched.responseURL || fullTextURL, doc: null };
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted || error?.name === "AbortError") throw error;
+      }
+    }
+
+    try {
+      const fetched = await AutoFullText.fetchDocument(fullTextURL, {
+        signal,
+        noCache: true,
+        anon: false,
+        headers: {
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          ...(referrerURL ? { Referer: referrerURL } : {}),
+          ...(userAgent ? { "User-Agent": userAgent } : {}),
+        },
+        maxBytes: 30 * 1024 * 1024,
+      });
+      if (fetched.rawText && !isChallengeHTML(fetched.rawText)) {
+        return { html: fetched.rawText, responseURL: fetched.responseURL || fullTextURL, doc: null };
+      }
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") throw error;
+    }
+
+    if (typeof handle?.navigateToArticle === "function") {
+      try {
+        const navigated = await handle.navigateToArticle(fullTextURL);
+        let navHTML = String(navigated?.html || "");
+        if (!navHTML && navigated?.doc?.documentElement) {
+          try { navHTML = String(navigated.doc.documentElement.outerHTML || ""); } catch {}
+        }
+        if (navHTML && !isChallengeHTML(navHTML)) {
+          return {
+            html: navHTML,
+            responseURL: navigated?.responseURL || fullTextURL,
+            doc: navigated?.doc || null,
+          };
+        }
+      } catch (error) {
+        if (signal?.aborted || error?.name === "AbortError" || error?.name === "FullTextChallengeCancelledError") {
+          throw error;
+        }
+      }
+    }
+
+    return null;
+  }
+
   async function snapshotArticleViaChallenge(challengeURL, workspace, signal, onProgress, { challengeInitTimeoutMs } = {}) {
     const canOpenChallenge = typeof AutoFullTextSupportingInfo !== "undefined" &&
       typeof AutoFullTextSupportingInfo?.openChallengeSession === "function" &&
@@ -1098,9 +1504,10 @@ var AutoFullTextTranslation = (function () {
         throwIfAborted(activeSignal);
         let activeURL = AutoFullText.validateArticleURL(responseURL || challengeURL);
         let activeHTML = String(html || "");
-        if (!activeHTML && doc?.documentElement) {
+        let activeLiveDoc = doc || null;
+        if (!activeHTML && activeLiveDoc?.documentElement) {
           try {
-            activeHTML = String(doc.documentElement.outerHTML || "");
+            activeHTML = String(activeLiveDoc.documentElement.outerHTML || "");
           } catch {
             activeHTML = "";
           }
@@ -1135,45 +1542,63 @@ var AutoFullTextTranslation = (function () {
           });
         }
 
-        const parsedDoc = new DOMParser().parseFromString(activeHTML, "text/html");
+        let parsedDoc = new DOMParser().parseFromString(activeHTML, "text/html");
         if (!parsedDoc.documentElement || parsedDoc.querySelector("parsererror")) {
           throw new Error("Article page returned invalid HTML.");
         }
 
-        handle?.setStatus?.("验证已通过，正在去除非正文部分并捕获页面样式…", activeURL);
-        emitProgress(onProgress, "验证已通过，正在清洗正文并捕获页面样式…", 18);
-        const challengeAuth = { handle, userAgent, referrerURL: activeURL };
-        const parsedRoot = chooseArticleRoot(parsedDoc);
-        const pageStyles = await capturePageStyles(parsedDoc, activeURL, activeSignal, challengeAuth);
-        const root = wrapWithAncestors(parsedRoot, parsedDoc);
-        let canvasCaptured = false;
-        if (doc && doc !== parsedDoc) {
-          try {
-            const liveRoot = chooseArticleRoot(doc);
-            if (liveRoot) {
-              captureCanvas(liveRoot, root);
-              canvasCaptured = true;
+        let cleaned = buildCleanedArticle(parsedDoc, activeURL, activeLiveDoc);
+        let triedFullTextURL = "";
+        const fullTextURL = findFullTextHTMLURL(parsedDoc, activeURL);
+        if (fullTextURL && (isLandingOrAbstractURL(activeURL) || cleaned.cleanedLen < 2500)) {
+          triedFullTextURL = fullTextURL;
+          handle?.setStatus?.("检测到全文 HTML 页面，正在自动切换并提取完整正文…", fullTextURL);
+          emitProgress(onProgress, "正在跳转到文章全文 HTML 页面…", 17);
+          const fullTextPage = await fetchFullTextHTMLInChallenge(fullTextURL, activeURL, handle, userAgent, activeSignal);
+          if (fullTextPage?.html) {
+            try {
+              const candidateDoc = new DOMParser().parseFromString(fullTextPage.html, "text/html");
+              if (candidateDoc.documentElement && !candidateDoc.querySelector("parsererror")) {
+                const candidateURL = AutoFullText.validateArticleURL(fullTextPage.responseURL || fullTextURL);
+                const candidateCleaned = buildCleanedArticle(candidateDoc, candidateURL, fullTextPage.doc);
+                if (candidateCleaned.cleanedLen > cleaned.cleanedLen && candidateCleaned.cleanedLen >= 500) {
+                  activeURL = candidateURL;
+                  activeHTML = fullTextPage.html;
+                  activeLiveDoc = fullTextPage.doc;
+                  parsedDoc = candidateDoc;
+                  cleaned = candidateCleaned;
+                  if (activeHTML.length * 2 > 30 * 1024 * 1024 + 65536) {
+                    throw new Error("HTTP resource exceeded its in-memory size limit.");
+                  }
+                  await workspace.writeText("article-page-original.html", activeHTML);
+                }
+              }
+            } catch (candidateError) {
+              if (activeSignal?.aborted || candidateError?.name === "AbortError") throw candidateError;
+              AutoFullText.log("Full-text HTML upgrade fallback failed; keeping initial page", candidateError);
             }
-          } catch {
-            canvasCaptured = false;
           }
         }
-        if (!canvasCaptured) captureCanvas(parsedRoot, root);
-        normalizeMathMarkup(root);
-        removeUnwantedContent(root, activeURL);
-        const cleanedHTML = root.outerHTML;
-        if (textLength(root) < 500) {
-          throw new Error("The cleaned article body is too short to translate.");
+
+        if (cleaned.cleanedLen < 500) {
+          const message = formatTooShortError(activeURL, parsedDoc, cleaned.rawVisibleLen, cleaned.cleanedLen, triedFullTextURL);
+          try { await workspace.writeText("translation-diagnostics.txt", message); } catch {}
+          throw new Error(message);
         }
+
+        handle?.setStatus?.("验证已通过，正在捕获页面样式并提取正文…", activeURL);
+        emitProgress(onProgress, "验证已通过，正在清洗正文并捕获页面样式…", 20);
+        const challengeAuth = { handle, userAgent, referrerURL: activeURL };
+        const pageStyles = await capturePageStyles(parsedDoc, activeURL, activeSignal, challengeAuth);
 
         handle?.setStatus?.("正在提取并内联文章图片资源…", activeURL);
         emitProgress(onProgress, "验证已通过，正在内联文章图片资源…", 26);
-        await inlineImages(root, activeURL, workspace, activeSignal, challengeAuth);
+        await inlineImages(cleaned.root, activeURL, workspace, activeSignal, challengeAuth);
         throwIfAborted(activeSignal);
         handle?.setStatus?.("正文与图片提取完成，正在关闭验证窗口并开始翻译…", activeURL);
         return {
-          html: root.outerHTML,
-          cleanedHTML,
+          html: cleaned.root.outerHTML,
+          cleanedHTML: cleaned.cleanedHTML,
           responseURL: activeURL,
           ...pageStyles,
           imagesInlined: true,
@@ -1229,15 +1654,54 @@ var AutoFullTextTranslation = (function () {
       return snapshotArticleViaChallenge(lastAttemptURL, workspace, signal, onProgress, { challengeInitTimeoutMs });
     }
 
-    const { doc, responseURL } = fetched;
+    let { doc, responseURL } = fetched;
     emitProgress(onProgress, "正在清洗正文并捕获页面样式…", 18);
     const sourceRoot = chooseArticleRoot(doc);
+    let cleaned = buildCleanedArticle(doc, responseURL, doc, sourceRoot);
+    const fullTextURL = findFullTextHTMLURL(doc, responseURL);
+    if (fullTextURL && (isLandingOrAbstractURL(responseURL) || cleaned.cleanedLen < 2500)) {
+      try {
+        emitProgress(onProgress, "检测到全文 HTML 页面，正在读取完整正文…", 19);
+        const fullTextFetched = await AutoFullText.fetchDocument(fullTextURL, {
+          signal,
+          headers: { Accept: "text/html,application/xhtml+xml" },
+          maxBytes: 30 * 1024 * 1024,
+        });
+        if (isChallengeHTML(fullTextFetched.rawText)) {
+          if (allowChallengeWindow) {
+            return snapshotArticleViaChallenge(fullTextFetched.responseURL || fullTextURL, workspace, signal, onProgress, { challengeInitTimeoutMs });
+          }
+        } else {
+          const candidateCleaned = buildCleanedArticle(fullTextFetched.doc, fullTextFetched.responseURL, fullTextFetched.doc);
+          if (candidateCleaned.cleanedLen > cleaned.cleanedLen && candidateCleaned.cleanedLen >= 500) {
+            doc = fullTextFetched.doc;
+            responseURL = fullTextFetched.responseURL;
+            cleaned = candidateCleaned;
+            await workspace.writeText("article-page-original.html", fullTextFetched.rawText);
+          }
+        }
+      } catch (upgradeError) {
+        if (signal?.aborted || upgradeError?.name === "AbortError") throw upgradeError;
+        if (allowChallengeWindow && isChallengeHTTP(upgradeError)) {
+          return snapshotArticleViaChallenge(fullTextURL, workspace, signal, onProgress, { challengeInitTimeoutMs });
+        }
+        AutoFullText.log("Direct full-text HTML upgrade failed; keeping initial page", upgradeError);
+      }
+    }
+    if (cleaned.cleanedLen < 500) {
+      const message = formatTooShortError(responseURL, doc, cleaned.rawVisibleLen, cleaned.cleanedLen, fullTextURL);
+      try { await workspace.writeText("translation-diagnostics.txt", message); } catch {}
+      throw new Error(message);
+    }
     const pageStyles = await capturePageStyles(doc, responseURL, signal);
-    const root = wrapWithAncestors(sourceRoot, doc);
-    captureCanvas(sourceRoot, root);
-    normalizeMathMarkup(root);
-    removeUnwantedContent(root, responseURL);
-    return { html: root.outerHTML, responseURL, ...pageStyles, imagesInlined: false, usedChallengeWindow: false };
+    return {
+      html: cleaned.root.outerHTML,
+      cleanedHTML: cleaned.cleanedHTML,
+      responseURL,
+      ...pageStyles,
+      imagesInlined: false,
+      usedChallengeWindow: false,
+    };
   }
 
   function throwIfAborted(signal) {
@@ -1389,5 +1853,9 @@ var AutoFullTextTranslation = (function () {
     assertChineseTranslation,
     sanitizeCSS,
     validateSegmentMarkers,
+    visibleTextLength,
+    findFullTextHTMLURL,
+    hasUsableArticleBody,
+    hasUsableArticleHTML,
   };
 })();

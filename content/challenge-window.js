@@ -3,6 +3,7 @@
   const MAX_POLL_MS = 300000;
   const POLL_INTERVAL_MS = 450;
   const HYDRATION_SETTLE_MS = 3200;
+  const TRANSLATION_HYDRATION_SETTLE_MS = 5500;
   const CHALLENGE_ORIGINS = [
     "https://challenges.cloudflare.com",
     "https://brunhild.challenges.cloudflare.com",
@@ -106,12 +107,15 @@
     let lastVerifiedURL = "";
     let inDownloadPhase = false;
     let mode = session?.mode || "article";
-    const isTranslationMode = mode === "translation";
+    const isTranslationSession = mode === "translation";
+    const isTranslationActive = () => mode === "translation" || mode === "translation-nav";
     let targetURL = session?.url || "";
     let secondaryTargetHost = "";
     let forceExtractRequested = false;
     let secondaryResolve = null;
     let secondaryReject = null;
+    let articleNavResolve = null;
+    let articleNavReject = null;
     let checkInFlight = false;
     let queuedRecheck = false;
     let lastObservedDocURL = "";
@@ -120,7 +124,7 @@
     let observerRecheckTimer = null;
     const observedHosts = new Set(["challenges.cloudflare.com", "brunhild.challenges.cloudflare.com"]);
 
-    const copy = isTranslationMode
+    const copy = isTranslationSession
       ? {
         enteredPage: "已进入出版商文章页，正在等待文章正文加载完成…",
         loginRequired: "检测到机构或账号登录页面，请完成登录，回到文章页后将自动提取正文…",
@@ -152,12 +156,12 @@
 
     if (session?.windowTitle) {
       try { document.title = String(session.windowTitle); } catch {}
-    } else if (isTranslationMode) {
+    } else if (isTranslationSession) {
       try { document.title = "Zotero PaperFlow — 全文翻译安全验证"; } catch {}
     }
     if (extractBtn) {
       if (session?.extractLabel) extractBtn.textContent = String(session.extractLabel);
-      else if (isTranslationMode) extractBtn.textContent = "已通过，立即提取正文";
+      else if (isTranslationSession) extractBtn.textContent = "已通过，立即提取正文";
     }
 
     function debugLog(message, error) {
@@ -872,6 +876,32 @@
             startPolling();
           });
         },
+        navigateToArticle(nextURL) {
+          return new Promise((resolve, reject) => {
+            try {
+              const parsed = new URL(String(nextURL || ""));
+              if (!/^https?:$/i.test(parsed.protocol) || isHostBlocked(parsed.hostname)) {
+                reject(new Error("Target full-text URL is invalid or blocked."));
+                return;
+              }
+            } catch {
+              reject(new Error("Target full-text URL is invalid."));
+              return;
+            }
+            inDownloadPhase = false;
+            mode = "translation-nav";
+            pageVerifiedAt = 0;
+            lastVerifiedURL = "";
+            lastObservedVerifiedDocURL = "";
+            lastObservedVerifiedAt = 0;
+            forceExtractRequested = false;
+            articleNavResolve = resolve;
+            articleNavReject = reject;
+            setStatus("验证已通过，正在打开全文 HTML 页面…", nextURL);
+            navigate(nextURL);
+            startPolling();
+          });
+        },
         close: closeSafely,
       };
     }
@@ -1026,8 +1056,19 @@
           }
           if (lastObservedVerifiedDocURL && !isLoginOrAuthDoc(null, lastObservedVerifiedDocURL)) {
             const observedElapsed = Date.now() - lastObservedVerifiedAt;
-            if (observedElapsed < HYDRATION_SETTLE_MS) {
+            const settleLimit = isTranslationActive() ? TRANSLATION_HYDRATION_SETTLE_MS : HYDRATION_SETTLE_MS;
+            if (observedElapsed < settleLimit) {
               setStatus(copy.waitingHydration, lastObservedVerifiedDocURL);
+              return;
+            }
+            if (mode === "translation-nav" && articleNavResolve) {
+              inDownloadPhase = true;
+              stopMonitoring();
+              const resolveNav = articleNavResolve;
+              articleNavResolve = null;
+              articleNavReject = null;
+              setStatus(copy.autoExtract, lastObservedVerifiedDocURL);
+              resolveNav({ doc: null, responseURL: lastObservedVerifiedDocURL, html: "", source: "http-observer-fallback" });
               return;
             }
             setStatus(copy.autoExtract, lastObservedVerifiedDocURL);
@@ -1042,7 +1083,7 @@
         }
 
         let hasExpectedContent = false;
-        if (isTranslationMode) {
+        if (isTranslationActive()) {
           try {
             if (doc && typeof session?.hasArticleContent === "function") {
               hasExpectedContent = Boolean(session.hasArticleContent(doc, currentURL));
@@ -1123,12 +1164,24 @@
         }
 
         const elapsed = Date.now() - pageVerifiedAt;
-        const waitingForFullDocument = isTranslationMode
-          ? (readyState && readyState !== "complete" && elapsed < HYDRATION_SETTLE_MS) ||
-            (!hasExpectedContent && elapsed < HYDRATION_SETTLE_MS)
-          : (!hasExpectedContent && ((readyState && readyState !== "complete") || elapsed < HYDRATION_SETTLE_MS));
+        const settleLimit = isTranslationActive() ? TRANSLATION_HYDRATION_SETTLE_MS : HYDRATION_SETTLE_MS;
+        const waitingForFullDocument = isTranslationActive()
+          ? (readyState && readyState !== "complete" && elapsed < settleLimit) ||
+            (!hasExpectedContent && elapsed < settleLimit)
+          : (!hasExpectedContent && ((readyState && readyState !== "complete") || elapsed < settleLimit));
         if (!forceExtractRequested && waitingForFullDocument) {
           setStatus(copy.waitingHydration, currentURL);
+          return;
+        }
+
+        if (mode === "translation-nav" && articleNavResolve) {
+          inDownloadPhase = true;
+          stopMonitoring();
+          const resolveNav = articleNavResolve;
+          articleNavResolve = null;
+          articleNavReject = null;
+          setStatus(copy.autoExtract, currentURL);
+          resolveNav({ doc, responseURL: currentURL, html: html || readDocumentHTML(doc), source: snapshot.source });
           return;
         }
 
@@ -1158,6 +1211,13 @@
           secondaryResolve = null;
           secondaryReject = null;
           rejectSecondary(new Error("等待二次安全验证超时。"));
+          return;
+        }
+        if (articleNavReject) {
+          const rejectNav = articleNavReject;
+          articleNavResolve = null;
+          articleNavReject = null;
+          rejectNav(new Error("等待全文 HTML 页面加载超时。"));
           return;
         }
         failSession(Object.assign(new Error("等待出版商安全验证超时。"), {
@@ -1253,6 +1313,12 @@
           secondaryReject = null;
           rejectSecondary(error);
         }
+        if (articleNavReject) {
+          const rejectNav = articleNavReject;
+          articleNavResolve = null;
+          articleNavReject = null;
+          rejectNav(error);
+        }
         failSession(error);
       });
     }
@@ -1272,6 +1338,12 @@
         secondaryResolve = null;
         secondaryReject = null;
         rejectSecondary(error);
+      }
+      if (articleNavReject) {
+        const rejectNav = articleNavReject;
+        articleNavResolve = null;
+        articleNavReject = null;
+        rejectNav(error);
       }
       settled = true;
       cleanup();

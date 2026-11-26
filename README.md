@@ -32,6 +32,8 @@
 
 **0.3.19 全文翻译 Cloudflare 质询自动跳过与人工验证：**生成中文「全文翻译」时，若读取文章网页遇到 HTTP 403 / Cloudflare 安全质询，现与 SI 共用独立安全验证窗口（全文翻译专用模式，按钮自动切换为「已通过，立即提取正文」），优先尝试自动跳过 Turnstile，若需人工点击则保留窗口等待完成；验证通过后自动采集已渲染文章页 HTML、去除导航/侧栏/参考文献等非正文内容、借助已验证会话补齐受保护的页面样式表与图片资源并自动关闭验证窗口，随后无缝执行逐段简体中文翻译、PDF 排版导出与 `全文翻译` 子附件导入。右下角全文翻译进度卡片同步支持「显示验证窗口」按钮，取消验证时自动清理临时工作区并立即释放任务锁。
 
+**0.3.20 修复过检后误报「正文过短」与自动切换全文 HTML 页面：**解决通过 Cloudflare 验证跳转到文章页后立刻报错 `The cleaned article body is too short to translate.` 的多类根因：修复 `removeAfter` 在截断 `References` 等尾部标题时误将外层 `<article>` 正文容器一并删除的严重缺陷；正文就绪判定改用去除 `<script>`/`<style>`/导航等非正文噪声后的真实可见正文长度，并在验证窗口增加动态页面加载稳定等待；清洗阶段将外层 ASP.NET `<form>` 容器安全解包为 `<div>`、防止宽泛噪声选择器（如 `[class*=metrics]`/`[class*=citation]`）误删正文主体，同时保护侧栏前置 `Supplementary information`/`References` 标题不触发整篇截断；针对 RSC `articlelanding` 等摘要着陆页，验证通过后自动识别并跳转（含验证窗口内导航 `navigateToArticle`）至完整 `articlehtml` 全文页再提取翻译；若仍不足正文长度则输出包含页面路径、标题及清洗前后字数的可读中文诊断并保存 `translation-diagnostics.txt`。
+
 ## 功能与实现结构
 
 ```text
@@ -100,7 +102,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ## 安装与试用
 
-1. 用 7-Zip 将 `zotero-paperflow-0.3.19.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
+1. 用 7-Zip 将 `zotero-paperflow-0.3.20.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
 2. 在 Zotero 中选择 **工具 → 插件 → 齿轮 → Install Plugin From File…**，选取该 XPI，按提示重启 Zotero。
 3. 打开 **编辑 → 设置 → Zotero PaperFlow**，分别选择两个选项并保存。全文翻译需选择已配置的供应商、设置模型与密钥环境变量、保存或自定义系统提示词；SI 的非 PDF 转换需要 Windows 与可用的 Microsoft Office 组件。PowerPoint 的 PDF 导出可能显示 PowerPoint 窗口。
 4. 新增具有 DOI/网页 URL 的测试文献验证自动选项；已有文献可在文库中选中后右键，分别执行补抓 SI 或生成中文全文翻译。
@@ -113,7 +115,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ```bash
 node scripts/build-xpi.mjs
-node test/package-smoke.mjs ../zotero-paperflow-0.3.19.xpi
+node test/package-smoke.mjs ../zotero-paperflow-0.3.20.xpi
 ```
 
 ## 当前验证边界
