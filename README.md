@@ -22,6 +22,8 @@
 
 **0.3.14 Cloudflare 质询窗口与自动导入（仿 Zotero Connector 流程）：**修复 Zotero 内置浏览器在 Cloudflare Turnstile（如 `challenges.cloudflare.com`、`brunhild.challenges.cloudflare.com`）下因 Cookie 隔离/追踪保护/UA 含 `Zotero/` 导致 `CORS request did not succeed (Status code: null)` 而无法跳过验证的问题。遇到 403 / Cloudflare 质询时自动弹出独立安全验证窗口（临时放行会话 Cookie、追踪保护与网络状态分区，并统一纯净 Firefox UA，关闭后自动还原全部偏好）；验证自动或手动通过后，自动提取文章页 SI 链接、在已验证会话内下载 SI 文件（必要时支持跨域会话回退与下载主机二次验证）、非 PDF 转 PDF、关闭窗口并自动导入为 Zotero 子附件。
 
+**0.3.15 SI 实时进度卡片、取消按钮与质询窗口启动修复：**修正 `chrome.manifest` 的 `content/` 路径并在 `bootstrap.js` 增加 `amIAddonManagerStartup.registerChrome` 动态注册，同时为质询窗口增加 6 秒初始化握手超时保护与会话表兜底，彻底解决 Zotero 10 打包 XPI 中质询窗口未弹出且任务锁死在「正在处理中」的问题；导入 SI 时在 Zotero 右下角实时显示当前阶段进度条，提供一键「取消导入」与「显示验证窗口」按钮，并在插件启停时彻底重置任务状态。
+
 ## 功能与实现结构
 
 ```text
@@ -90,7 +92,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ## 安装与试用
 
-1. 用 7-Zip 将 `zotero-paperflow-0.3.14.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
+1. 用 7-Zip 将 `zotero-paperflow-0.3.15.xpi` 作为压缩包打开并确认根目录含 `manifest.json`、`bootstrap.js`、`chrome.manifest` 与 `defaults/`。
 2. 在 Zotero 中选择 **工具 → 插件 → 齿轮 → Install Plugin From File…**，选取该 XPI，按提示重启 Zotero。
 3. 打开 **编辑 → 设置 → Zotero PaperFlow**，分别选择两个选项并保存。全文翻译需选择已配置的供应商、设置模型与密钥环境变量、保存或自定义系统提示词；SI 的非 PDF 转换需要 Windows 与可用的 Microsoft Office 组件。PowerPoint 的 PDF 导出可能显示 PowerPoint 窗口。
 4. 新增具有 DOI/网页 URL 的测试文献验证自动选项；已有文献可在文库中选中后右键，分别执行补抓 SI 或生成中文全文翻译。
@@ -103,7 +105,7 @@ test/generate-website-style-smoke.mjs 用于生成网页样式 smoke HTML
 
 ```bash
 node scripts/build-xpi.mjs
-node test/package-smoke.mjs ../zotero-paperflow-0.3.14.xpi
+node test/package-smoke.mjs ../zotero-paperflow-0.3.15.xpi
 ```
 
 ## 当前验证边界

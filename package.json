@@ -1,0 +1,14 @@
+{
+  "name": "zotero-paperflow",
+  "version": "0.3.15",
+  "private": true,
+  "description": "Zotero 10 bootstrap XPI plugin for Supporting Information import and Chinese full-text translation PDFs.",
+  "scripts": {
+    "dev": "node scripts/preview-server.mjs",
+    "start": "node scripts/preview-server.mjs",
+    "build": "node test/static-smoke.mjs && node test/behavior-smoke.mjs",
+    "lint": "node test/static-smoke.mjs",
+    "test": "node test/static-smoke.mjs && node test/behavior-smoke.mjs",
+    "package": "node scripts/build-xpi.mjs"
+  }
+}

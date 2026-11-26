@@ -59,7 +59,24 @@
 
   function init() {
     const rawArgs = window.arguments?.[0];
-    const session = rawArgs?.wrappedJSObject || rawArgs || null;
+    let session = rawArgs?.wrappedJSObject || rawArgs || null;
+    if (!session) {
+      try {
+        const sid = new URL(window.location?.href || "").searchParams.get("sid") || "";
+        const registry = window.opener?.Zotero?._autoFullTextChallengeSessions;
+        if (sid && registry?.has?.(sid)) {
+          session = registry.get(sid);
+          registry.delete(sid);
+        }
+      } catch {
+        // Ignore fallback lookup failure.
+      }
+    }
+    try {
+      session?.onWindowReady?.(window);
+    } catch {
+      // Ignore ready callback failure.
+    }
     const statusEl = document.getElementById("si-challenge-status");
     const urlEl = document.getElementById("si-challenge-url");
     const reloadBtn = document.getElementById("si-challenge-reload");
@@ -88,8 +105,14 @@
     const observedHosts = new Set(["challenges.cloudflare.com", "brunhild.challenges.cloudflare.com"]);
 
     function setStatus(text, currentURL = "") {
-      if (statusEl) statusEl.textContent = String(text || "");
+      const normalized = String(text || "");
+      if (statusEl) statusEl.textContent = normalized;
       if (urlEl && currentURL) urlEl.textContent = String(currentURL);
+      try {
+        session?.onStatus?.(normalized, currentURL);
+      } catch {
+        // Ignore status callback error.
+      }
     }
 
     function isHostBlocked(host) {

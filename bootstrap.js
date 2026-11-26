@@ -1,11 +1,25 @@
 /* Loads plugin modules after Zotero's bootstrap globals are available. */
 var AutoFullTextScope = null;
+var AutoFullTextChromeHandle = null;
 
 async function startup({ id, version, rootURI }, reason) {
   try {
     await Zotero.initializationPromise;
     if (typeof rootURI !== "string" || !rootURI) {
       throw new Error("Zotero did not provide the plugin rootURI to bootstrap startup.");
+    }
+    const baseURI = rootURI.endsWith("/") ? rootURI : `${rootURI}/`;
+    try {
+      const aomStartup = Components?.classes?.["@mozilla.org/addons/addon-manager-startup;1"]
+        ?.getService?.(Components.interfaces?.amIAddonManagerStartup);
+      if (aomStartup && Services?.io?.newURI) {
+        AutoFullTextChromeHandle?.destruct?.();
+        AutoFullTextChromeHandle = aomStartup.registerChrome(Services.io.newURI(`${baseURI}manifest.json`), [
+          ["content", "zotero-auto-fulltext", "content/"],
+        ]);
+      }
+    } catch (chromeError) {
+      Zotero.debug(`[Zotero PaperFlow] Dynamic chrome registration skipped: ${String(chromeError)}`);
     }
     const scope = {
       Zotero,
@@ -36,7 +50,6 @@ async function startup({ id, version, rootURI }, reason) {
       "content/modules/fulltext-translation.js",
       "content/modules/main.js",
     ];
-    const baseURI = rootURI.endsWith("/") ? rootURI : `${rootURI}/`;
     for (const script of scripts) {
       Services.scriptloader.loadSubScript(`${baseURI}${script}`, scope);
     }
@@ -57,6 +70,12 @@ async function shutdown(data, reason) {
   } catch (error) {
     Zotero.logError(error);
   } finally {
+    try {
+      AutoFullTextChromeHandle?.destruct?.();
+    } catch (chromeError) {
+      Zotero.logError(chromeError);
+    }
+    AutoFullTextChromeHandle = null;
     AutoFullTextScope = null;
   }
 }

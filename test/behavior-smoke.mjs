@@ -772,7 +772,7 @@ assert.equal(siWorkspaceCleaned, true);
   const observerCount = (topic) => activeObservers.get(topic)?.size || 0;
 
   const makeMockChallengeDialog = (scriptBehavior) => (chromeURL, _name, _features, wrappedArgs) => {
-    assert.equal(chromeURL, "chrome://zotero-auto-fulltext/content/challenge-window.xhtml");
+    assert.ok(chromeURL.startsWith("chrome://zotero-auto-fulltext/content/challenge-window.xhtml?sid="), `unexpected dialog URL: ${chromeURL}`);
     const listeners = new Map();
     const browserListeners = new Map();
     const buttonListeners = new Map();
@@ -828,6 +828,7 @@ assert.equal(siWorkspaceCleaned, true);
       setAttribute: () => {},
     };
     const dialogWindow = {
+      location: { href: chromeURL },
       arguments: [wrappedArgs],
       addEventListener: (type, fn) => {
         if (!listeners.has(type)) listeners.set(type, []);
@@ -930,6 +931,10 @@ assert.equal(siWorkspaceCleaned, true);
     TextDecoder,
     TextEncoder,
     Uint8Array,
+    Map,
+    encodeURIComponent,
+    setTimeout,
+    clearTimeout,
     OS: {
       File: { writeAtomic: async (path, bytes) => { challengeWorkspaceFiles.set(path, bytes); } },
     },
@@ -1238,6 +1243,26 @@ assert.equal(siWorkspaceCleaned, true);
   assert.equal(secondarySaveAsCancelled, true, "secondary attachment response should cancel browser Save As dialog and hand off to downloadBounded");
   assert.equal(secondaryHttpAttempts, 2);
   assert.equal(challengeImports.length, 4);
+
+  // Scenario G: Broken/unloaded challenge dialog (never calls onWindowReady) -> watchdog aborts quickly instead of hanging forever
+  let brokenDialogClosed = false;
+  const origGetMainWindow = challengeSupportContext.Zotero.getMainWindow;
+  challengeSupportContext.Zotero.getMainWindow = () => ({
+    navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Zotero/10.0.8" },
+    openDialog: () => ({ focus: () => {}, close: () => { brokenDialogClosed = true; } }),
+  });
+  const progressEvents = [];
+  await assert.rejects(
+    siMod.addForItem({ id: 206, getAttachments: () => [] }, null, {
+      challengeInitTimeoutMs: 40,
+      onProgress: (ev) => progressEvents.push(ev),
+    }),
+    (error) => error.name === "SupportingInfoAccessError" && /未能正常初始化/.test(error.message),
+  );
+  assert.equal(brokenDialogClosed, true, "broken challenge dialog must be closed by init watchdog");
+  assert.ok(progressEvents.some((ev) => /正在读取出版商文章页/.test(ev.stage || "")), "must emit initial reading progress");
+  assert.ok(progressEvents.some((ev) => /正在打开验证窗口/.test(ev.stage || "")), "must emit opening challenge progress");
+  challengeSupportContext.Zotero.getMainWindow = origGetMainWindow;
 }
 
 let releaseDelay;
@@ -1357,6 +1382,8 @@ const manualContext = {
   Map,
   Number,
   Promise,
+  setTimeout,
+  clearTimeout,
 };
 vm.createContext(manualContext);
 vm.runInContext(read("content/modules/main.js"), manualContext);
@@ -1467,6 +1494,66 @@ releaseManualSI({ skipped: false, usedChallengeWindow: true });
 await flushManual();
 assert.match(manualAlerts.at(-1), /完成 1 项/);
 
+// Verify floating progress panel with Cancel button aborts an in-flight SI task and releases lock immediately
+{
+  const panelNodes = new Map();
+  const makeNode = (tag) => {
+    const node = {
+      tagName: tag,
+      _id: "",
+      get id() { return this._id; },
+      set id(v) { this._id = v; if (v) panelNodes.set(v, this); },
+      textContent: "",
+      disabled: false,
+      style: { cssText: "", display: "", width: "", background: "" },
+      children: [],
+      listeners: new Map(),
+      appendChild(child) { this.children.push(child); return child; },
+      append(...items) { this.children.push(...items); },
+      addEventListener(type, fn) { this.listeners.set(type, fn); },
+      click() { this.listeners.get("click")?.(); },
+      remove() { if (this._id) panelNodes.delete(this._id); },
+    };
+    return node;
+  };
+  const docRoot = makeNode("window");
+  manualWindow.document = {
+    documentElement: docRoot,
+    createElementNS: (_ns, tag) => makeNode(tag),
+    getElementById: (id) => panelNodes.get(id) || null,
+  };
+  const prevAdd = manualContext.AutoFullTextSupportingInfo.addForItem;
+  let cancelObservedInSI = false;
+  manualContext.AutoFullTextSupportingInfo.addForItem = async (_item, signal, opts) => {
+    manualSICalls += 1;
+    opts?.onProgress?.({ stage: "正在读取出版商文章页…", percent: 20 });
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        cancelObservedInSI = true;
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      }, { once: true });
+    });
+  };
+  await clickImport();
+  const stageNode = panelNodes.get("zotero-auto-fulltext-si-stage");
+  const cancelBtnNode = panelNodes.get("zotero-auto-fulltext-si-cancel-btn");
+  assert.ok(stageNode, "floating SI progress panel must appear immediately on click");
+  assert.match(stageNode.textContent, /正在读取出版商文章页/);
+  assert.ok(cancelBtnNode, "floating SI progress panel must render a cancel button");
+  cancelBtnNode.click();
+  await flushManual();
+  assert.equal(cancelObservedInSI, true, "clicking cancel button must abort in-flight SI import");
+  assert.match(manualAlerts.at(-1), /补处理已取消/);
+  // Clicking again must start cleanly (no stuck '正在处理中' lock!)
+  manualContext.AutoFullTextSupportingInfo.addForItem = prevAdd;
+  const callsAfterPanelCancel = manualSICalls;
+  await clickImport();
+  assert.equal(manualSICalls, callsAfterPanelCancel + 1, "after clicking cancel button, next SI click must start a fresh task");
+  releaseManualSI({ skipped: false });
+  await flushManual();
+  delete manualWindow.document;
+}
+
 const callsBeforeTranslation = manualSICalls;
 const translationsBeforeMenu = translatedItems.length;
 manualMenu.menus[1].onCommand(null, singleSelection);
@@ -1478,6 +1565,8 @@ manualContext.AutoFullTextMain.shutdown();
 const packagedRoot = "jar:file:///test/zotero-auto-fulltext.xpi!/";
 const loadedScripts = [];
 const startupErrors = [];
+let chromeRegistered = false;
+let chromeDestructed = false;
 const bootstrapContext = vm.createContext({
   Zotero: {
     initializationPromise: Promise.resolve(),
@@ -1491,8 +1580,23 @@ const bootstrapContext = vm.createContext({
     logError: (error) => startupErrors.push(error),
   },
   ChromeUtils: { importESModule: () => ({ OS: {} }) },
-  Components: {},
+  Components: {
+    classes: {
+      "@mozilla.org/addons/addon-manager-startup;1": {
+        getService: () => ({
+          registerChrome: (manifestURI, entries) => {
+            assert.equal(manifestURI.spec, `${packagedRoot}manifest.json`);
+            assert.equal(JSON.stringify(entries), JSON.stringify([["content", "zotero-auto-fulltext", "content/"]]));
+            chromeRegistered = true;
+            return { destruct: () => { chromeDestructed = true; } };
+          },
+        }),
+      },
+    },
+    interfaces: { amIAddonManagerStartup: {} },
+  },
   Services: {
+    io: { newURI: (spec) => ({ spec }) },
     obs: { addObserver: () => {}, removeObserver: () => {} },
     scriptloader: {
       loadSubScript(uri, scope) {
@@ -1516,10 +1620,12 @@ const bootstrapContext = vm.createContext({
 vm.runInContext(read("bootstrap.js"), bootstrapContext);
 await bootstrapContext.startup({ id: "test", version: JSON.parse(read("manifest.json")).version, rootURI: packagedRoot });
 assert.deepEqual(startupErrors, []);
+assert.equal(chromeRegistered, true, "bootstrap startup should dynamically register chrome://zotero-auto-fulltext/content/");
 assert.equal(loadedScripts.length, 6);
 assert.equal(loadedScripts.at(-1), "content/modules/main.js");
 assert.equal(bootstrapContext.AutoFullTextScope.AbortController, AbortController);
 await bootstrapContext.shutdown();
+assert.equal(chromeDestructed, true, "bootstrap shutdown should unregister dynamic chrome handle");
 assert.equal(bootstrapContext.AutoFullTextScope, null);
 assert.deepEqual(startupErrors, []);
 

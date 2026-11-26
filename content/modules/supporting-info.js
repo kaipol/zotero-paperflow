@@ -5,7 +5,28 @@ var AutoFullTextSupportingInfo = (function () {
   const filePattern = new RegExp(`\\.(?:${fileExtensions.join("|")})(?:$|[^a-z0-9])`, "i");
   const htmlFilePattern = /\.html?$/i;
   const maxFileBytes = 100 * 1024 * 1024;
+  const CHALLENGE_INIT_TIMEOUT_MS = 6000;
   let challengeSessionQueue = Promise.resolve();
+
+  function resetSessionState() {
+    challengeSessionQueue = Promise.resolve();
+    try {
+      if (Zotero._autoFullTextChallengeSessions instanceof Map) {
+        Zotero._autoFullTextChallengeSessions.clear();
+      }
+    } catch {
+      // Ignore cleanup errors on shutdown.
+    }
+  }
+
+  function emitProgress(onProgress, stage, percent, extra = null) {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress({ stage, percent, ...(extra || {}) });
+    } catch {
+      // Ignore UI callback errors.
+    }
+  }
 
   function readStatus(result, key) {
     try {
@@ -450,6 +471,8 @@ var AutoFullTextSupportingInfo = (function () {
     signal = null,
     userAgent = "",
     onVerified,
+    onProgress = null,
+    initTimeoutMs = CHALLENGE_INIT_TIMEOUT_MS,
   }) {
     const validatedURL = AutoFullText.validateArticleURL(challengeURL);
     const mainWin = Zotero.getMainWindow?.();
@@ -462,6 +485,40 @@ var AutoFullTextSupportingInfo = (function () {
     const launch = () => {
       throwIfAborted(signal);
       return new Promise((resolve, reject) => {
+        const sid = `si-${Zotero.Utilities.randomString(10)}`;
+        if (!(Zotero._autoFullTextChallengeSessions instanceof Map)) {
+          Zotero._autoFullTextChallengeSessions = new Map();
+        }
+        let finished = false;
+        let dialogRef = null;
+        let initTimer = null;
+        const cleanupSession = () => {
+          if (initTimer) {
+            clearTimeout(initTimer);
+            initTimer = null;
+          }
+          try { Zotero._autoFullTextChallengeSessions?.delete?.(sid); } catch {}
+          signal?.removeEventListener("abort", onExternalAbort);
+          emitProgress(onProgress, "", null, { challengeWindow: null });
+        };
+        const finishResolve = (value) => {
+          if (finished) return;
+          finished = true;
+          cleanupSession();
+          resolve(value);
+        };
+        const finishReject = (error) => {
+          if (finished) return;
+          finished = true;
+          cleanupSession();
+          reject(error);
+        };
+        const onExternalAbort = () => {
+          try { dialogRef?.close?.(); } catch {}
+          finishReject(Object.assign(new Error("Supporting information verification cancelled."), { name: "AbortError" }));
+        };
+        signal?.addEventListener("abort", onExternalAbort, { once: true });
+
         const args = {
           url: validatedURL,
           userAgent,
@@ -469,21 +526,48 @@ var AutoFullTextSupportingInfo = (function () {
           isChallengeDocument,
           isBlockedHost: (host) => AutoFullText.isLocalHost?.(host) || AutoFullText.isIPAddress?.(host) || false,
           hasSupportingLink: (doc, currentURL) => Boolean(extractSupportingLink(doc, currentURL)),
+          onWindowReady: (readyWin) => {
+            if (initTimer) {
+              clearTimeout(initTimer);
+              initTimer = null;
+            }
+            if (readyWin) dialogRef = readyWin;
+            emitProgress(onProgress, "等待出版商安全验证（自动跳过或手动完成）…", 40, { challengeWindow: dialogRef });
+          },
+          onStatus: (statusText) => {
+            if (statusText) emitProgress(onProgress, statusText, null, { challengeWindow: dialogRef });
+          },
           onVerified,
-          resolve,
-          reject,
+          resolve: finishResolve,
+          reject: finishReject,
         };
+        Zotero._autoFullTextChallengeSessions.set(sid, args);
         const wrapped = { wrappedJSObject: args };
         try {
-          const dialog = mainWin.openDialog(
-            CHALLENGE_WINDOW_URL,
+          emitProgress(onProgress, "需要安全验证，正在打开验证窗口…", 30);
+          initTimer = setTimeout(() => {
+            if (finished) return;
+            try { dialogRef?.close?.(); } catch {}
+            finishReject(Object.assign(new Error("安全验证窗口未能正常初始化，请检查插件安装或重试。"), {
+              name: "SupportingInfoAccessError",
+              publisherURL: validatedURL,
+            }));
+          }, initTimeoutMs);
+          dialogRef = mainWin.openDialog(
+            `${CHALLENGE_WINDOW_URL}?sid=${encodeURIComponent(sid)}`,
             `zotero-auto-fulltext-si-challenge-${Zotero.Utilities.randomString(6)}`,
             "chrome,centerscreen,resizable,scrollbars,width=980,height=740",
             wrapped,
           );
-          dialog?.focus?.();
+          dialogRef?.focus?.();
+          if (!dialogRef) {
+            finishReject(Object.assign(new Error("Zotero 未能弹出安全验证窗口。"), {
+              name: "SupportingInfoAccessError",
+              publisherURL: validatedURL,
+            }));
+          }
         } catch (error) {
-          reject(Object.assign(new Error(`无法打开安全验证窗口：${String(error?.message || error)}`), {
+          finishReject(Object.assign(new Error(`无法打开安全验证窗口：${String(error?.message || error)}`), {
             name: "SupportingInfoAccessError",
             publisherURL: validatedURL,
           }));
@@ -495,30 +579,36 @@ var AutoFullTextSupportingInfo = (function () {
     return queued;
   }
 
-  async function runViaChallengeWindow(item, challengeURL, workspace, signal, attempt, userAgent) {
+  async function runViaChallengeWindow(item, challengeURL, workspace, signal, attempt, userAgent, onProgress, initTimeoutMs) {
     attempt.stage = "等待出版商安全验证";
     attempt.request = null;
     return openChallengeSession(challengeURL, {
       signal,
       userAgent,
+      onProgress,
+      initTimeoutMs,
       async onVerified({ doc, responseURL, html, handle }) {
         const activeSignal = combineSignals(signal, handle?.signal || null);
         throwIfAborted(activeSignal);
         await workspace.writeText("si-source-article.html", html);
         await workspace.writeText("si-source-article-parsed.html", html);
         attempt.stage = "识别 SI 链接";
+        emitProgress(onProgress, "验证已通过，正在识别 SI 链接…", 55);
         const link = extractSupportingLink(doc, responseURL);
         if (!link) throw new Error("No supporting-information link was found on the article webpage.");
         if (await hasExistingAttachment(item, link.url)) {
           handle.setStatus?.("该 SI 附件已存在，已跳过重复导入。");
+          emitProgress(onProgress, "该 SI 附件已存在，已跳过重复导入。", 100);
           return { skipped: true };
         }
         const filePrefix = `si-${Zotero.Utilities.randomString(6)}-`;
         attempt.stage = "下载第一份 SI 文件";
         attempt.request = null;
         handle.setStatus?.(`已找到 SI（${link.filename}），正在自动下载…`, link.url);
+        emitProgress(onProgress, `已找到 SI（${link.filename}），正在自动下载…`, 70);
         const downloaded = await downloadVerifiedLink(handle, link, responseURL, workspace, filePrefix, activeSignal, attempt, userAgent);
         handle.setStatus?.("SI 下载完成，正在导入 Zotero 附件…");
+        emitProgress(onProgress, "SI 下载完成，准备导入 Zotero…", 82);
         return { skipped: false, downloaded, link };
       },
     });
@@ -581,12 +671,14 @@ var AutoFullTextSupportingInfo = (function () {
     if (file.fileSize > maxFileBytes) throw new Error("Supporting file exceeds the 100 MB limit.");
   }
 
-  async function importPDF(item, path, title, workspace, signal, attempt) {
+  async function importPDF(item, path, title, workspace, signal, attempt, onProgress = null) {
     attempt.stage = "校验或转换 SI 文件";
+    emitProgress(onProgress, "正在校验或转换 SI 文件为 PDF…", 88);
     throwIfAborted(signal);
     checkFileSize(Zotero.File.pathToFile(path));
     const pdfPath = await AutoFullTextPdf.convertToPdf(path, workspace, signal);
     attempt.stage = "导入 Zotero 子附件";
+    emitProgress(onProgress, "正在导入 Zotero 子附件…", 95);
     throwIfAborted(signal);
     const attachment = await Zotero.Attachments.importFromFile({
       file: Zotero.File.pathToFile(pdfPath),
@@ -595,14 +687,20 @@ var AutoFullTextSupportingInfo = (function () {
       contentType: "application/pdf",
     });
     if (!attachment?.id) throw new Error("Zotero 没有返回已导入的 SI 附件。");
+    emitProgress(onProgress, "SI 附件导入完成。", 100);
   }
 
-  async function addForItem(item, signal = null, { allowChallengeWindow = true } = {}) {
+  async function addForItem(item, signal = null, {
+    allowChallengeWindow = true,
+    onProgress = null,
+    challengeInitTimeoutMs = CHALLENGE_INIT_TIMEOUT_MS,
+  } = {}) {
     const articleURL = AutoFullText.itemURL(item, { preferDOI: true });
     if (!articleURL) throw new Error("No article URL or DOI is available for SI discovery.");
     const attempt = { stage: "读取出版商文章页", request: null };
     const userAgent = getBrowserUserAgent();
     const canOpenChallenge = allowChallengeWindow && typeof Zotero.getMainWindow?.()?.openDialog === "function";
+    emitProgress(onProgress, "正在读取出版商文章页…", 15);
 
     return withWorkspace(signal, attempt, async (workspace) => {
       let directResult = null;
@@ -611,13 +709,18 @@ var AutoFullTextSupportingInfo = (function () {
         const { link, responseURL, parsedHTML } = await findLinks(articleURL, signal, workspace, attempt, userAgent);
         await workspace.writeText("si-source-article-parsed.html", parsedHTML);
         throwIfAborted(signal);
+        emitProgress(onProgress, "正在识别文章页中的 SI 链接…", 45);
         if (!link) throw new Error("No supporting-information link was found on the article webpage.");
 
-        if (await hasExistingAttachment(item, link.url)) return { skipped: true };
+        if (await hasExistingAttachment(item, link.url)) {
+          emitProgress(onProgress, "该 SI 附件已存在，已跳过重复导入。", 100);
+          return { skipped: true };
+        }
 
         const filePrefix = `si-${Zotero.Utilities.randomString(6)}-`;
         attempt.stage = "下载第一份 SI 文件";
         attempt.request = null;
+        emitProgress(onProgress, `已找到 SI（${link.filename}），正在下载…`, 65);
         try {
           const downloaded = await downloadBounded(link.url, workspace, filePrefix, link.filename, responseURL, signal, attempt, userAgent);
           directResult = { skipped: false, downloaded, link };
@@ -637,7 +740,16 @@ var AutoFullTextSupportingInfo = (function () {
       }
 
       if (challengeTargetURL) {
-        const verified = await runViaChallengeWindow(item, challengeTargetURL, workspace, signal, attempt, userAgent);
+        const verified = await runViaChallengeWindow(
+          item,
+          challengeTargetURL,
+          workspace,
+          signal,
+          attempt,
+          userAgent,
+          onProgress,
+          challengeInitTimeoutMs,
+        );
         if (verified.skipped) return { skipped: true, usedChallengeWindow: true };
         const attachmentSuffix = `[${stableSuffix(verified.link.url)}]`;
         await importPDF(
@@ -647,6 +759,7 @@ var AutoFullTextSupportingInfo = (function () {
           workspace,
           signal,
           attempt,
+          onProgress,
         );
         return { skipped: false, usedChallengeWindow: true };
       }
@@ -659,6 +772,7 @@ var AutoFullTextSupportingInfo = (function () {
         workspace,
         signal,
         attempt,
+        onProgress,
       );
       return { skipped: false, usedChallengeWindow: false };
     });
@@ -666,6 +780,7 @@ var AutoFullTextSupportingInfo = (function () {
 
   return {
     addForItem,
+    resetSessionState,
     isChallengeHTML,
     isChallengeDocument,
     extractSupportingLink,

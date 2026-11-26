@@ -21,8 +21,14 @@ for (const module of modules) {
   assert.ok(existsSync(join(root, "content", "modules", module)), `missing bootstrap module: ${module}`);
 }
 
+assert.match(bootstrap, /AutoFullTextChromeHandle/);
+assert.match(bootstrap, /registerChrome/);
+const chromeManifest = read("chrome.manifest");
+assert.match(chromeManifest, /^content zotero-auto-fulltext content\/\s*$/);
+assert.doesNotMatch(chromeManifest, /\.\/content\//);
+
 const manifest = JSON.parse(read("manifest.json"));
-assert.equal(manifest.version, "0.3.14");
+assert.equal(manifest.version, "0.3.15");
 assert.equal(manifest.name, "Zotero PaperFlow");
 assert.equal(manifest.applications.zotero.strict_min_version, "10.0.8");
 assert.equal(manifest.applications.zotero.strict_max_version, "10.*");
@@ -65,9 +71,11 @@ assert.match(challengeWindowXhtml, /id="zotero-auto-fulltext-challenge-window"/)
 assert.match(challengeWindowXhtml, /id="si-challenge-browser"/);
 assert.match(challengeWindowXhtml, /type="content"/);
 assert.match(challengeWindowXhtml, /remote="false"/);
-assert.match(challengeWindowXhtml, /chrome:\/\/zotero-auto-fulltext\/content\/challenge-window\.js/);
+assert.match(challengeWindowXhtml, /<script src="chrome:\/\/zotero-auto-fulltext\/content\/challenge-window\.js"\/>/);
 
 const challengeWindowScript = read("content/challenge-window.js");
+assert.match(challengeWindowScript, /onWindowReady/);
+assert.match(challengeWindowScript, /_autoFullTextChallengeSessions/);
 assert.match(challengeWindowScript, /network\.cookie\.cookieBehavior/);
 assert.match(challengeWindowScript, /privacy\.partition\.network_state/);
 assert.match(challengeWindowScript, /privacy\.trackingprotection\.enabled/);
@@ -87,6 +95,8 @@ assert.match(challengeWindowScript, /SupportingInfoChallengeCancelledError/);
 
 const supportingInfo = read("content/modules/supporting-info.js");
 assert.match(supportingInfo, /const CHALLENGE_WINDOW_URL = "chrome:\/\/zotero-auto-fulltext\/content\/challenge-window\.xhtml"/);
+assert.match(supportingInfo, /const CHALLENGE_INIT_TIMEOUT_MS = 6000/);
+assert.match(supportingInfo, /function resetSessionState\(/);
 assert.match(supportingInfo, /let challengeSessionQueue = Promise\.resolve\(\)/);
 assert.match(supportingInfo, /function combineSignals\(/);
 assert.match(supportingInfo, /isBareDOISupplLanding/);
@@ -207,6 +217,11 @@ assert.match(main, /const GENERATE_TRANSLATION = "生成全文翻译"/);
 assert.match(main, /Zotero\.openInViewer\(AutoFullText\.validateArticleURL\(failure\.publisherURL\)\)/);
 assert.match(main, /function showSIFailure\(/);
 assert.match(main, /function showSISuccessNotice\(/);
+assert.match(main, /function createSIProgressPanel\(/);
+assert.match(main, /zotero-auto-fulltext-si-cancel-btn/);
+assert.match(main, /取消导入/);
+assert.match(main, /显示验证窗口/);
+assert.match(main, /resetSessionState/);
 assert.match(main, /SupportingInfoChallengeCancelledError/);
 assert.match(main, /allowChallengeWindow: true/);
 assert.match(main, /releaseAction\("supportingInfo"\)/);
