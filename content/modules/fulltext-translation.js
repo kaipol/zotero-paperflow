@@ -448,7 +448,55 @@ var AutoFullTextTranslation = (function () {
     formElement.replaceWith(wrapper);
   }
 
+  function recoverNoscriptImages(root) {
+    for (const noscript of Array.from(root.querySelectorAll("noscript"))) {
+      try {
+        let fallbackSrc = "";
+        let fallbackSrcset = "";
+        const fallbackImg = noscript.querySelector?.("img");
+        if (fallbackImg) {
+          fallbackSrc = String(fallbackImg.getAttribute?.("src") || "").trim();
+          fallbackSrcset = String(fallbackImg.getAttribute?.("srcset") || "").trim();
+        } else {
+          const text = String(noscript.textContent || "");
+          const srcMatch = text.match(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/i);
+          const srcsetMatch = text.match(/<img\b[^>]*\bsrcset\s*=\s*["']([^"']+)["']/i);
+          if (srcMatch?.[1]) fallbackSrc = srcMatch[1].trim();
+          if (srcsetMatch?.[1]) fallbackSrcset = srcsetMatch[1].trim();
+        }
+        if ((!fallbackSrc || isPlaceholderImageURL(fallbackSrc)) && !fallbackSrcset) continue;
+        const parent = noscript.parentElement;
+        if (!parent) continue;
+        const siblings = parent.children || [];
+        const idx = siblings.indexOf(noscript);
+        const adjacent = [siblings[idx - 1], siblings[idx + 1]].filter(Boolean);
+        let targetImg = null;
+        for (const node of adjacent) {
+          if (node.localName?.toLowerCase() === "img") {
+            targetImg = node;
+            break;
+          }
+          const nested = node.querySelector?.("img");
+          if (nested) {
+            targetImg = nested;
+            break;
+          }
+        }
+        if (!targetImg) {
+          targetImg = Array.from(parent.querySelectorAll?.("img") || []).find((img) =>
+            img !== fallbackImg && isPlaceholderImageURL(img.getAttribute?.("src")),
+          ) || null;
+        }
+        if (targetImg && targetImg !== fallbackImg && isPlaceholderImageURL(targetImg.getAttribute?.("src"))) {
+          if (fallbackSrc && !isPlaceholderImageURL(fallbackSrc)) targetImg.setAttribute("src", fallbackSrc);
+          if (fallbackSrcset && !targetImg.getAttribute?.("srcset")) targetImg.setAttribute("srcset", fallbackSrcset);
+        }
+      } catch {}
+    }
+  }
+
   function removeUnwantedContent(root, baseURL, contentNode = null) {
+    recoverNoscriptImages(root);
     const dangerousSelectors = [
       "script", "style", "noscript", "iframe", "object", "embed", "applet", "base", "link", "meta[http-equiv]",
     ].join(",");
@@ -535,19 +583,170 @@ var AutoFullTextTranslation = (function () {
     }
   }
 
+  const LAZY_IMAGE_ATTRS = [
+    "data-src", "data-original", "data-lazy-src", "data-lazy", "data-img-src", "data-image-src",
+    "data-highres", "data-hi-res", "data-large", "data-full-src", "data-fullsrc", "data-src-retina",
+    "data-url", "data-actualsrc", "data-echo", "data-figure-src", "data-asset-src", "data-thumb", "data-lightbox",
+  ];
+  const IMAGE_FILE_LINK_PATTERN = /\.(?:png|jpe?g|gif|webp|avif|svg)(?:$|[?#])|[_-]hi-?res\.(?:gif|png|jpe?g|webp)(?:$|[?#])/i;
+
+  function parseSrcset(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return [];
+    if (/^data:/i.test(raw) && !/\s+\d+(?:\.\d+)?[wx]\s*,/i.test(raw)) {
+      const spaceIdx = raw.search(/\s+/);
+      const url = spaceIdx >= 0 ? raw.slice(0, spaceIdx) : raw;
+      return [{ url: url.trim(), score: 1 }];
+    }
+    return raw.split(/,(?=\s*(?:https?:\/\/|\/\/|\/|\.{1,2}\/|data:|[^\s,]+\.[a-z0-9]{2,5}(?:[?#\s]|$)))/i)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const pieces = part.split(/\s+/);
+        const descriptor = pieces[1] || "1x";
+        const amount = parseFloat(descriptor) || 1;
+        return { url: pieces[0], score: descriptor.endsWith("w") ? amount / 1000 : amount };
+      })
+      .sort((a, b) => b.score - a.score);
+  }
+
+  function isPlaceholderImageURL(raw) {
+    const value = String(raw || "").trim();
+    if (!value) return true;
+    if (value === "#" || /^(?:about:blank|javascript:|blob:|vbscript:)/i.test(value)) return true;
+    if (/^data:image\/(?:gif|png);base64,/i.test(value) && value.length < 220) return true;
+    if (/^data:image\/svg\+xml/i.test(value) && value.length < 260 && !/<(?:path|circle|rect|polygon|polyline|line|ellipse|text|g)\b/i.test(value)) {
+      return true;
+    }
+    try {
+      const path = new URL(value, "https://placeholder.invalid/").pathname.toLowerCase();
+      if (/(?:^|\/)(?:blank|spacer|pixel|transparent|placeholder|loading|spinner|empty|1x1|clear)\.(?:gif|png|svg|jpe?g)$/i.test(path)) {
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function isHiddenImage(image, root = null) {
+    if (!image) return true;
+    const role = String(image.getAttribute?.("role") || "").trim().toLowerCase();
+    if (role === "presentation" || role === "none") return true;
+    const widthAttr = String(image.getAttribute?.("width") || "").trim().replace(/px$/i, "");
+    const heightAttr = String(image.getAttribute?.("height") || "").trim().replace(/px$/i, "");
+    if ((widthAttr !== "" && Number(widthAttr) <= 1) || (heightAttr !== "" && Number(heightAttr) <= 1)) {
+      return true;
+    }
+    let current = image;
+    let depth = 0;
+    while (current && current !== root && depth < 6) {
+      if (current.getAttribute?.("hidden") !== null) return true;
+      if (String(current.getAttribute?.("aria-hidden") || "").trim().toLowerCase() === "true") return true;
+      const style = String(current.getAttribute?.("style") || "").toLowerCase();
+      if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b/.test(style)) return true;
+      current = current.parentElement;
+      depth += 1;
+    }
+    return false;
+  }
+
+  function isDecorativeBadgeOrIcon(image) {
+    if (!image) return true;
+    const alt = String(image.getAttribute?.("alt") || "").trim();
+    const inFigure = Boolean(image.closest?.("figure,.figure,.fig,.image_table,.img_tbl"));
+    if (inFigure && /\b(?:fig(?:ure)?|scheme|chart|table|graph|diagram|spectrum|micrograph)\b|[图表]/i.test(alt)) {
+      return false;
+    }
+    const idClass = `${image.getAttribute?.("id") || ""} ${image.getAttribute?.("class") || ""}`;
+    const rawSrc = `${image.getAttribute?.("src") || ""} ${image.getAttribute?.("data-src") || ""}`;
+    const badgePattern = /(?:^|[\s_./-])(?:spinner|loader|loading|spacer|pixel|tracker|orcid|altmetric|crossmark|dimensions|plumx|creativecommons|licensebuttons|cc-by|badge|avatar|logo|icon|favicon)(?:$|[\s_./-])/i;
+    return badgePattern.test(idClass) || badgePattern.test(rawSrc) || badgePattern.test(alt);
+  }
+
+  function collectImageCandidates(image, baseURL) {
+    const rawCandidates = [];
+    const seenRaw = new Set();
+    const pushRaw = (value) => {
+      const trimmed = String(value || "").trim();
+      if (!trimmed || seenRaw.has(trimmed)) return;
+      seenRaw.add(trimmed);
+      rawCandidates.push(trimmed);
+    };
+
+    for (const attr of ["srcset", "data-srcset", "data-lazy-srcset"]) {
+      for (const entry of parseSrcset(image.getAttribute?.(attr))) {
+        if (!isPlaceholderImageURL(entry.url)) pushRaw(entry.url);
+      }
+    }
+
+    if (image.parentElement?.localName?.toLowerCase() === "picture") {
+      for (const source of Array.from(image.parentElement.querySelectorAll?.("source") || [])) {
+        for (const attr of ["srcset", "data-srcset", "data-lazy-srcset"]) {
+          for (const entry of parseSrcset(source.getAttribute?.(attr))) {
+            if (!isPlaceholderImageURL(entry.url)) pushRaw(entry.url);
+          }
+        }
+        const sourceSrc = String(source.getAttribute?.("src") || "").trim();
+        if (sourceSrc && !isPlaceholderImageURL(sourceSrc)) pushRaw(sourceSrc);
+      }
+    }
+
+    for (const attr of LAZY_IMAGE_ATTRS) {
+      const value = String(image.getAttribute?.(attr) || "").trim();
+      if (value && !isPlaceholderImageURL(value)) pushRaw(value);
+    }
+
+    for (const attr of Array.from(image.attributes || [])) {
+      const name = String(attr.name || "").toLowerCase();
+      if (!name.startsWith("data-") || LAZY_IMAGE_ATTRS.includes(name) || name.includes("srcset")) continue;
+      if (!/^data-(?:.*(?:src|img|image|url|highres|hi-res|large|full|orig|thumb|figure|asset|zoom|lazy|retina))$/i.test(name)) continue;
+      const value = String(attr.value || "").trim();
+      if (!value || isPlaceholderImageURL(value)) continue;
+      if (/^(?:https?:\/\/|\/\/|\/|data:image\/)/i.test(value) || IMAGE_FILE_LINK_PATTERN.test(value)) {
+        pushRaw(value);
+      }
+    }
+
+    for (const value of [image.currentSrc, image.getAttribute?.("src")]) {
+      const trimmed = String(value || "").trim();
+      if (trimmed && !isPlaceholderImageURL(trimmed)) pushRaw(trimmed);
+    }
+
+    const wrappingAnchor = image.closest?.("a[href]") || (image.parentElement?.localName?.toLowerCase() === "a" ? image.parentElement : null);
+    const anchorHref = String(wrappingAnchor?.getAttribute?.("href") || "").trim();
+    if (anchorHref && IMAGE_FILE_LINK_PATTERN.test(anchorHref) && !isPlaceholderImageURL(anchorHref)) {
+      pushRaw(anchorHref);
+    }
+
+    const validated = [];
+    const seenValidated = new Set();
+    const rejectedReasons = [];
+    for (const raw of rawCandidates) {
+      if (/^data:image\//i.test(raw)) {
+        if (!seenValidated.has(raw)) {
+          seenValidated.add(raw);
+          validated.push(raw);
+        }
+        continue;
+      }
+      if (/^data:/i.test(raw)) {
+        rejectedReasons.push("non-image data URI");
+        continue;
+      }
+      try {
+        const checked = AutoFullText.validateResourceURL(raw, baseURL);
+        if (!seenValidated.has(checked)) {
+          seenValidated.add(checked);
+          validated.push(checked);
+        }
+      } catch (error) {
+        rejectedReasons.push(String(error?.message || error));
+      }
+    }
+    return { candidates: validated, rejectedReasons, hadAnySource: rawCandidates.length > 0 };
+  }
+
   function selectImageURL(image, baseURL) {
-    const srcset = image.getAttribute("srcset") || image.getAttribute("data-srcset") || "";
-    const candidates = srcset.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
-      const pieces = part.split(/\s+/);
-      const descriptor = pieces[1] || "1x";
-      const amount = parseFloat(descriptor) || 1;
-      return { url: pieces[0], score: descriptor.endsWith("w") ? amount / 1000 : amount };
-    }).sort((a, b) => b.score - a.score);
-    const candidate = candidates[0]?.url || image.currentSrc || image.getAttribute("src") ||
-      image.getAttribute("data-src") || image.getAttribute("data-original") || image.getAttribute("data-lazy-src");
-    if (!candidate) return "";
-    if (candidate.startsWith("data:")) return candidate;
-    return AutoFullText.validateResourceURL(candidate, baseURL);
+    return collectImageCandidates(image, baseURL).candidates[0] || "";
   }
 
   function base64FromBytes(bytes) {
@@ -592,17 +791,96 @@ var AutoFullTextTranslation = (function () {
   }
 
   function bytesFromDataURI(url) {
-    const match = /^data:(image\/(?:png|jpeg|gif|webp|avif|svg\+xml));base64,([A-Za-z0-9+/=]+)$/i.exec(url);
-    if (!match) throw new Error("Only base64-encoded raster or SVG data images are supported.");
-    const estimate = Math.floor(match[2].length * 0.75);
-    if (estimate > imageLimits.one) throw new Error("A data image exceeds the 12 MB per-image limit.");
-    const binary = atob(match[2]);
-    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    if (!bytes.length || bytes.length > imageLimits.one) throw new Error("A data image exceeds the 12 MB per-image limit.");
-    return { bytes, mime: match[1].toLowerCase() };
+    const raw = String(url || "").trim();
+    const base64Match = /^data:(image\/(?:png|jpeg|jpg|gif|webp|avif|svg\+xml))(?:;charset=[^;,]+)?;base64,([A-Za-z0-9+/=\s]+)$/i.exec(raw);
+    if (base64Match) {
+      let mime = base64Match[1].toLowerCase();
+      if (mime === "image/jpg") mime = "image/jpeg";
+      const payload = base64Match[2].replace(/\s+/g, "");
+      const estimate = Math.floor(payload.length * 0.75);
+      if (estimate > imageLimits.one) throw new Error("A data image exceeds the 12 MB per-image limit.");
+      const binary = atob(payload);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      if (!bytes.length || bytes.length > imageLimits.one) throw new Error("A data image exceeds the 12 MB per-image limit.");
+      return { bytes, mime };
+    }
+    const svgMatch = /^data:image\/svg\+xml(?:;charset=[^;,]+|;utf8)?,([\s\S]+)$/i.exec(raw);
+    if (svgMatch) {
+      let decoded = svgMatch[1];
+      try {
+        decoded = decodeURIComponent(decoded);
+      } catch {
+        // Keep raw when unencoded characters like '#' appear in inline SVG data URIs.
+      }
+      const bytes = new TextEncoder().encode(decoded);
+      if (!bytes.length || bytes.length > imageLimits.one) throw new Error("A data image exceeds the 12 MB per-image limit.");
+      return { bytes, mime: "image/svg+xml" };
+    }
+    throw new Error("Only base64-encoded raster or SVG data images are supported.");
+  }
+
+  function sniffImageMime(bytes, contentType, resolvedURL) {
+    let mime = String(contentType || "").split(";")[0].trim().toLowerCase();
+    if (mime === "image/jpg" || mime === "image/pjpeg") mime = "image/jpeg";
+    else if (mime === "image/x-png") mime = "image/png";
+    if (mime === "image/svg+xml" || /^image\/(?:png|jpeg|gif|webp|avif)$/.test(mime)) {
+      return mime;
+    }
+    try {
+      if (resolvedURL && new URL(resolvedURL).pathname.toLowerCase().endsWith(".svg")) {
+        return "image/svg+xml";
+      }
+    } catch {}
+    if (bytes && bytes.length >= 4) {
+      if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+      if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+      if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
+      if (bytes.length >= 12 &&
+        bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+        bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+        return "image/webp";
+      }
+      if (!mime || mime === "application/octet-stream" || mime === "text/xml" || mime === "application/xml" || mime === "text/plain") {
+        const prefix = new TextDecoder("utf-8").decode(bytes.subarray(0, Math.min(bytes.length, 512))).trimStart();
+        if (/^(?:<\?xml[\s\S]*?\?>\s*)?(?:<!DOCTYPE\s+svg[\s\S]*?>\s*)?<svg[\s>]/i.test(prefix)) {
+          return "image/svg+xml";
+        }
+      }
+    }
+    return "";
+  }
+
+  function clearLazyImageAttributes(image) {
+    image.removeAttribute("srcset");
+    image.removeAttribute("data-srcset");
+    image.removeAttribute("data-lazy-srcset");
+    image.removeAttribute("loading");
+    for (const attr of LAZY_IMAGE_ATTRS) image.removeAttribute(attr);
+  }
+
+  function removeOrReplaceUnavailableImage(image, reason = "") {
+    if (!image || !image.parentNode) return;
+    const alt = String(image.getAttribute?.("alt") || "").replace(/\s+/g, " ").trim();
+    const decorative = isDecorativeBadgeOrIcon(image);
+    const inFigure = Boolean(image.closest?.("figure,.figure,.fig,.image_table,.img_tbl"));
+    AutoFullText.log(`Omitting unavailable article image (${alt || "no alt"})`, reason || "no safe source");
+    if (!decorative && alt.length >= 3 && (inFigure || /\b(?:fig(?:ure)?|scheme|chart|table|graph|diagram)\b|[图表]/i.test(alt))) {
+      const doc = image.ownerDocument;
+      if (doc && typeof doc.createElement === "function") {
+        const note = doc.createElement("span");
+        note.setAttribute("class", "paperflow-omitted-figure");
+        note.textContent = `[图片未能加载：${alt.slice(0, 140)}]`;
+        image.replaceWith(note);
+        return;
+      }
+    }
+    image.remove();
   }
 
   async function inlineImages(root, baseURL, workspace, signal, challengeAuth = null) {
+    for (const img of Array.from(root.querySelectorAll("img"))) {
+      if (isHiddenImage(img, root)) img.remove();
+    }
     const images = Array.from(root.querySelectorAll("img"));
     if (images.length > imageLimits.count) throw new Error("The article contains too many images to safely export.");
     let totalBytes = 0;
@@ -621,31 +899,20 @@ var AutoFullTextTranslation = (function () {
       totalBytes += bytes.length;
       const finalBytes = mime === "image/svg+xml" ? sanitizeSVG(bytes) : bytes;
       image.setAttribute("src", `data:${mime};base64,${base64FromBytes(finalBytes)}`);
-      image.removeAttribute("srcset");
-      image.removeAttribute("data-srcset");
-      image.removeAttribute("data-src");
-      image.removeAttribute("data-original");
-      image.removeAttribute("data-lazy-src");
+      clearLazyImageAttributes(image);
     };
 
     const applyInlinedImage = (image, bytes, contentType, resolvedURL) => {
       if (!bytes.length || bytes.length > imageLimits.one) throw new Error("Image size is invalid or exceeds 12 MB.");
       if (totalBytes + bytes.length > imageLimits.all) throw new Error("Article images exceed the 40 MB export limit.");
-      totalBytes += bytes.length;
-      let mime = String(contentType || "").split(";")[0].trim().toLowerCase();
-      if (mime === "image/svg+xml" || new URL(resolvedURL).pathname.toLowerCase().endsWith(".svg")) {
-        mime = "image/svg+xml";
-      } else if (!/^image\/(?:png|jpeg|gif|webp|avif)$/.test(mime)) {
-        throw new Error(`Unexpected or unsupported image response type ${mime || "(missing)"}.`);
+      const mime = sniffImageMime(bytes, contentType, resolvedURL);
+      if (!mime) {
+        throw new Error(`Unexpected or unsupported image response type ${String(contentType || "").split(";")[0].trim() || "(missing)"}.`);
       }
+      totalBytes += bytes.length;
       const finalBytes = mime === "image/svg+xml" ? sanitizeSVG(bytes) : bytes;
       image.setAttribute("src", `data:${mime};base64,${base64FromBytes(finalBytes)}`);
-      image.removeAttribute("srcset");
-      image.removeAttribute("data-srcset");
-      image.removeAttribute("data-src");
-      image.removeAttribute("data-original");
-      image.removeAttribute("data-lazy-src");
-      image.removeAttribute("loading");
+      clearLazyImageAttributes(image);
     };
 
     const requestImageOnce = async (url, { anon = true, noCache = false, headers = {} } = {}) => {
@@ -802,17 +1069,38 @@ var AutoFullTextTranslation = (function () {
       throw new Error("Image download did not complete.");
     };
 
+    const isFatalImageError = (error) => {
+      if (!error) return false;
+      if (signal?.aborted || controller.signal.aborted || error.name === "AbortError") return true;
+      return /exceeds? the .*limit|12 MB|40 MB|too many images/i.test(String(error.message || ""));
+    };
+
     const worker = async () => {
       while (!failure && !signal?.aborted && !controller.signal.aborted) {
         const image = images[next++];
         if (!image) return;
         try {
-          const candidate = selectImageURL(image, baseURL);
-          if (!candidate) {
-            throw new Error("An article image has no safe, usable HTTPS source; refusing to export a document with a missing figure.");
+          const { candidates, rejectedReasons } = collectImageCandidates(image, baseURL);
+          if (!candidates.length) {
+            removeOrReplaceUnavailableImage(image, rejectedReasons.join("; ") || "no usable image source");
+            continue;
           }
-          if (candidate.startsWith("data:")) await persistDataImage(image, candidate);
-          else await downloadImage(image, candidate);
+          let inlined = false;
+          let lastError = null;
+          for (const candidate of candidates) {
+            try {
+              if (candidate.startsWith("data:")) await persistDataImage(image, candidate);
+              else await downloadImage(image, candidate);
+              inlined = true;
+              break;
+            } catch (candidateError) {
+              if (isFatalImageError(candidateError)) throw candidateError;
+              lastError = candidateError;
+            }
+          }
+          if (!inlined) {
+            removeOrReplaceUnavailableImage(image, String(lastError?.message || lastError || "image download failed"));
+          }
         } catch (error) {
           if (!failure) failure = error;
           controller.abort();
@@ -1857,5 +2145,7 @@ var AutoFullTextTranslation = (function () {
     findFullTextHTMLURL,
     hasUsableArticleBody,
     hasUsableArticleHTML,
+    collectImageCandidates,
+    selectImageURL,
   };
 })();

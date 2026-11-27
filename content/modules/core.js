@@ -22,6 +22,8 @@ var AutoFullText = (function () {
     "acm.org", "elifesciences.org", "embopress.org", "cshlp.org", "rupress.org",
     "biologists.com", "beilstein-journals.org", "thieme-connect.com", "karger.com",
     "liebertpub.com", "zenodo.org", "datadryad.org", "osf.io",
+    "sciencedirectassets.com", "mdpi-res.com", "literatumonline.com",
+    "highwire-cdn.com", "oupcdn.com", "atypon.com", "wiley-vch.de",
   ];
 
   function getPref(key) {

@@ -2653,6 +2653,241 @@ assert.equal(siWorkspaceCleaned, true);
       assert.equal(navResolved.responseURL, rscFullTextURL);
       assert.ok(navResolved.html.includes("Interfacial defect passivation"));
     }
+
+    // Scenario Q: Regression tests for v0.3.21 — image source recovery (<picture>, lazy data-*, wrapping <a href>, <noscript>), magic-byte MIME sniffing, safe stripping of empty/hidden/third-party-badge <img>, and figure fallback text without aborting translation
+    {
+      assert.equal(
+        core.validateResourceURL("https://pub.mdpi-res.com/energies/fig1.png", "https://www.mdpi.com/1996-1073/1/1/1"),
+        "https://pub.mdpi-res.com/energies/fig1.png",
+        "MDPI asset CDN must be on the trusted publisher allowlist",
+      );
+      assert.equal(
+        core.validateResourceURL("https://sdfestaticassets-us-east-1.sciencedirectassets.com/fig1.png", "https://www.sciencedirect.com/science/article/pii/S1234"),
+        "https://sdfestaticassets-us-east-1.sciencedirectassets.com/fig1.png",
+        "ScienceDirect asset CDN must be on the trusted publisher allowlist",
+      );
+      assert.throws(
+        () => core.validateResourceURL("https://badges.dimensions.ai/badge.png", "https://pubs.rsc.org/en/content/articlehtml/2026/ee/d6ee05315g"),
+        /trusted publisher allowlist/,
+        "third-party badge host must still be blocked by validateResourceURL",
+      );
+
+      const qArticleURL = "https://pubs.rsc.org/en/content/articlehtml/2026/ee/d6ee05315g";
+      const fetchedImageURLs = [];
+      const qWritten = new Map();
+      let qAttached = "";
+      let qCleaned = false;
+      const buildComplexImagesDoc = () => {
+        const doc = {
+          nodeType: 9,
+          title: "Complex Images Article",
+          documentElement: new MiniNode(1, "html"),
+          body: new MiniNode(1, "body"),
+          createElement(tag) {
+            const n = new MiniNode(1, tag);
+            n.ownerDocument = doc;
+            return n;
+          },
+          createTextNode(text) {
+            const n = new MiniNode(3);
+            n._text = String(text || "");
+            n.ownerDocument = doc;
+            return n;
+          },
+          createDocumentFragment() {
+            const f = new MiniNode(11);
+            f.ownerDocument = doc;
+            return f;
+          },
+          querySelector(sel) { return doc.documentElement.querySelector(sel); },
+          querySelectorAll(sel) { return doc.documentElement.querySelectorAll(sel); },
+        };
+        doc.documentElement.ownerDocument = doc;
+        doc.body.ownerDocument = doc;
+        doc.documentElement.appendChild(doc.body);
+
+        const article = doc.createElement("article");
+        const p = doc.createElement("p");
+        p.textContent = cfParagraphText;
+        article.appendChild(p);
+
+        // 1. Empty lightbox modal <img> with src=""
+        const emptyModalImg = doc.createElement("img");
+        emptyModalImg.setAttribute("id", "fig-modal-img");
+        emptyModalImg.setAttribute("src", "");
+        article.appendChild(emptyModalImg);
+
+        // 2. Hidden <img>
+        const hiddenImg = doc.createElement("img");
+        hiddenImg.setAttribute("style", "display: none");
+        hiddenImg.setAttribute("src", "");
+        article.appendChild(hiddenImg);
+
+        // 3. Untrusted third-party badge <img> (must NOT be fetched and must NOT abort translation)
+        const badgeImg = doc.createElement("img");
+        badgeImg.setAttribute("src", "https://badges.dimensions.ai/badge.png");
+        badgeImg.setAttribute("alt", "Dimensions badge");
+        article.appendChild(badgeImg);
+
+        // 4. <picture><source srcset="..."><img alt="Fig. 1"></picture>
+        const picture = doc.createElement("picture");
+        const source = doc.createElement("source");
+        source.setAttribute("srcset", "https://pubs.rsc.org/en/content/figure/pic1.png 2x");
+        const picImg = doc.createElement("img");
+        picImg.setAttribute("alt", "Fig. 1");
+        picture.appendChild(source);
+        picture.appendChild(picImg);
+        article.appendChild(picture);
+
+        // 5. Lazy <img> with 1x1 blank GIF placeholder in src and real URL in data-highres
+        const lazyImg = doc.createElement("img");
+        lazyImg.setAttribute("src", "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
+        lazyImg.setAttribute("data-highres", "/en/content/figure/lazy1.png");
+        lazyImg.setAttribute("alt", "Fig. 2");
+        article.appendChild(lazyImg);
+
+        // 6. Wrapping <a href="...png"><img alt="Fig. 3"></a>
+        const figLink = doc.createElement("a");
+        figLink.setAttribute("href", "/en/content/figure/wrap1.png");
+        const wrapImg = doc.createElement("img");
+        wrapImg.setAttribute("alt", "Fig. 3");
+        figLink.appendChild(wrapImg);
+        article.appendChild(figLink);
+
+        // 7. <noscript> fallback paired with blank <img>
+        const nsWrapper = doc.createElement("div");
+        const nsTargetImg = doc.createElement("img");
+        nsTargetImg.setAttribute("src", "");
+        nsTargetImg.setAttribute("alt", "Fig. 4");
+        const noscript = doc.createElement("noscript");
+        const nsFallbackImg = doc.createElement("img");
+        nsFallbackImg.setAttribute("src", "/en/content/figure/ns1.png");
+        noscript.appendChild(nsFallbackImg);
+        nsWrapper.appendChild(nsTargetImg);
+        nsWrapper.appendChild(noscript);
+        article.appendChild(nsWrapper);
+
+        // 8. Genuinely missing figure with descriptive alt inside <figure>
+        const missingFig = doc.createElement("figure");
+        const missingImg = doc.createElement("img");
+        missingImg.setAttribute("src", "");
+        missingImg.setAttribute("alt", "Fig. 5 XRD pattern");
+        missingFig.appendChild(missingImg);
+        article.appendChild(missingFig);
+
+        doc.body.appendChild(article);
+        return doc;
+      };
+
+      let capturedSnapshotHTML = "";
+      const qCtx = {
+        URL,
+        Date,
+        Math,
+        Uint8Array,
+        ArrayBuffer,
+        TextEncoder,
+        TextDecoder,
+        AbortController,
+        atob,
+        btoa,
+        setTimeout,
+        clearTimeout,
+        DOMParser: class {
+          parseFromString(html) {
+            if (html.includes("MARKER_COMPLEX_IMAGES")) return buildComplexImagesDoc();
+            capturedSnapshotHTML = html;
+            return buildMiniDocFromHtml(html);
+          }
+        },
+        OS: { File: { makeDir: async () => {} } },
+        Zotero: {
+          Prefs: { get: () => null, set: () => {} },
+          debug: () => {},
+          getMainWindow: () => ({ openDialog: () => ({ focus: () => {}, close: () => {} }) }),
+          HTTP: {
+            request: async (_method, reqURL, opts) => {
+              if (reqURL === qArticleURL) {
+                const err = new Error("HTTP 403");
+                err.status = 403;
+                err.xmlhttp = { status: 403, getResponseHeader: (h) => h.toLowerCase() === "cf-mitigated" ? "challenge" : "" };
+                throw err;
+              }
+              fetchedImageURLs.push(reqURL);
+              opts?.cancellerReceiver?.(() => {});
+              opts?.requestObserver?.({ addEventListener: () => {} });
+              return {
+                status: 200,
+                response: pngBytes,
+                responseURL: reqURL,
+                // Return application/octet-stream on lazy1.png to test magic-byte PNG sniffing
+                getResponseHeader: (h) => h.toLowerCase() === "content-type"
+                  ? (reqURL.endsWith("lazy1.png") ? "application/octet-stream" : "image/png")
+                  : "",
+              };
+            },
+          },
+        },
+        AutoFullTextSupportingInfo: {
+          isChallengeHTML: siMod.isChallengeHTML,
+          isChallengeDocument: siMod.isChallengeDocument,
+          getBrowserUserAgent: () => "Mozilla/5.0 Firefox/140.0",
+          openChallengeSession: async (_url, options) => {
+            const fakeHandle = {
+              signal: options.signal,
+              setStatus: () => {},
+            };
+            return options.onVerified({
+              doc: null,
+              responseURL: qArticleURL,
+              html: "<html><body><!-- MARKER_COMPLEX_IMAGES --></body></html>",
+              source: "pagedata-actor",
+              handle: fakeHandle,
+            });
+          },
+        },
+        AutoFullTextTranslator: {
+          getActiveProvider: () => ({ name: "TestProvider", model: "test-model" }),
+          getSystemPrompt: () => "Translate to Simplified Chinese.",
+          translate: async () => cfParagraphZh,
+        },
+        AutoFullTextPdf: {
+          createWorkspace: async () => ({
+            path: "/tmp/test-complex-images",
+            file: (name) => `/tmp/test-complex-images/${name}`,
+            writeText: async (name, content) => { qWritten.set(name, content); },
+            cleanup: async () => { qCleaned = true; },
+          }),
+          makeWebsitePdfPage: (html) => `<!doctype html><html><body>${html}</body></html>`,
+          printHtmlToPdf: async () => {},
+          attachPdf: async (_id, _path, title) => { qAttached = title; },
+        },
+      };
+      vm.createContext(qCtx);
+      vm.runInContext(read("content/modules/core.js"), qCtx);
+      vm.runInContext(read("content/modules/fulltext-translation.js"), qCtx);
+
+      await qCtx.AutoFullTextTranslation.create({
+        id: 92,
+        key: "IMG92",
+        getField: (f) => f === "url" ? qArticleURL : "",
+      });
+      assert.deepEqual(
+        fetchedImageURLs.sort(),
+        [
+          "https://pubs.rsc.org/en/content/figure/lazy1.png",
+          "https://pubs.rsc.org/en/content/figure/ns1.png",
+          "https://pubs.rsc.org/en/content/figure/pic1.png",
+          "https://pubs.rsc.org/en/content/figure/wrap1.png",
+        ],
+        "must recover and fetch <picture>, lazy data-highres, wrapped <a href>, and <noscript> images while never fetching untrusted third-party badges",
+      );
+      assert.equal((capturedSnapshotHTML.match(/data:image\/png;base64,/g) || []).length, 4, "all 4 recoverable figures must be inlined as base64 PNGs");
+      assert.doesNotMatch(capturedSnapshotHTML, /badges\.dimensions\.ai|fig-modal-img|display:\s*none/i, "empty modal, hidden, and untrusted third-party badge <img> must be removed");
+      assert.match(capturedSnapshotHTML, /\[图片未能加载：Fig\. 5 XRD pattern\]/, "genuinely missing figure must degrade gracefully to a readable placeholder note");
+      assert.equal(qAttached, "全文翻译");
+      assert.equal(qCleaned, true);
+    }
   }
 }
 
